@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.local.openai-route-controller</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE_PATH__</string>
+    <string>__INSTALL_DIR__/controller.mjs</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__INSTALL_DIR__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MIHOMO_SOCKET</key>
+    <string>__MIHOMO_SOCKET__</string>
+    <key>MIHOMO_PROXY</key>
+    <string>__MIHOMO_PROXY__</string>
+    <key>OPENAI_GROUP</key>
+    <string>__OPENAI_GROUP__</string>
+    <key>STATE_PATH</key>
+    <string>__INSTALL_DIR__/state.json</string>
+    <key>CURL_PATH</key>
+    <string>__CURL_PATH__</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__INSTALL_DIR__/controller.log</string>
+  <key>StandardErrorPath</key>
+  <string>__INSTALL_DIR__/controller.error.log</string>
+</dict>
+</plist>

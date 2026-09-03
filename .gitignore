@@ -1,0 +1,16 @@
+.DS_Store
+node_modules/
+*.log
+*.log.1
+state.json
+state.json.*
+backups/
+.env
+*.secret
+*.secret.*
+mihomo.secret*
+settings.json
+node.path
+*.disabled.*
+.vscode/
+.idea/

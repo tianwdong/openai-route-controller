@@ -1,0 +1,31 @@
+{
+  "name": "openai-route-controller",
+  "version": "0.1.0",
+  "description": "Circuit-breaker route controller for OpenAI and Codex traffic through Mihomo",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tianwdong/openai-route-controller.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tianwdong/openai-route-controller/issues"
+  },
+  "homepage": "https://github.com/tianwdong/openai-route-controller#readme",
+  "type": "module",
+  "scripts": {
+    "test": "node --test controller.test.mjs controller.integration.test.mjs script.test.mjs",
+    "check": "node --check controller.mjs && node --check lib.mjs && node --check Script.openai.js",
+    "verify": "npm test && npm run check"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "mihomo",
+    "clash-verge-rev",
+    "openai",
+    "codex",
+    "circuit-breaker"
+  ]
+}
