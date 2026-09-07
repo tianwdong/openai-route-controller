@@ -26,6 +26,7 @@ import {
   nodeRegion,
   normalizeState,
   networkPathChanged,
+  observeNetworkPath,
   parseDefaultNetworkPath,
   parseNetworkSetupProxy,
   passiveErrorKey,
@@ -42,6 +43,7 @@ import {
   recordNodePathProbe,
   recordNodeProbe,
   recordProviderHealth,
+  recordProviderRefreshAttempts,
   recordSelectionValidation,
   recoveryBackoffDelayForReason,
   recoveryReason,
@@ -54,6 +56,7 @@ import {
 const args = new Set(process.argv.slice(2));
 const shadowMode = args.has("--shadow") || args.has("--dry-run") || args.has("--once");
 const onceMode = args.has("--once");
+const mainRoute = process.env.ROUTE_PROFILE === "main";
 
 function envEnabled(name) {
   return /^(1|true|yes|on)$/i.test(process.env[name] || "");
@@ -79,13 +82,19 @@ const config = {
     || (process.platform === "darwin" ? "/tmp/verge/verge-mihomo.sock" : ""),
   apiUrl: process.env.MIHOMO_API || "",
   apiSecret: process.env.MIHOMO_SECRET || "",
-  groupName: process.env.OPENAI_GROUP || "OpenAI 自动选择",
-  statePath: process.env.STATE_PATH || defaultStatePath,
-  proxyUrl: process.env.MIHOMO_PROXY || "http://127.0.0.1:7897",
+  groupName: process.env.ROUTE_GROUP || process.env.OPENAI_GROUP
+    || (mainRoute ? "主代理自动选择" : "OpenAI 自动选择"),
+  probeBasePort: mainRoute ? 18000 : 17900,
+  statePath: process.env.STATE_PATH || (mainRoute
+    ? defaultStatePath.replace(/OpenAI Route Controller|openai-route-controller/g,
+      (name) => name.startsWith("OpenAI") ? "Main Route Controller" : "main-route-controller")
+    : defaultStatePath),
+  proxyUrl: process.env.MIHOMO_PROXY
+    || (mainRoute ? "http://127.0.0.1:18100" : "http://127.0.0.1:7897"),
   curlPath: process.env.CURL_PATH
     || (process.platform === "win32" ? "curl.exe" : "curl"),
   macosSystemProxySync: process.platform === "darwin"
-    && envEnabled("MACOS_SYSTEM_PROXY_SYNC"),
+    && !mainRoute && envEnabled("MACOS_SYSTEM_PROXY_SYNC"),
   macosProxyServices: (process.env.MACOS_PROXY_SERVICES || "Wi-Fi")
     .split(",")
     .map((service) => service.trim())
@@ -173,6 +182,18 @@ const config = {
   },
 };
 
+// Main traffic has its own endpoints and state. Shared Mihomo `alive` can be
+// overwritten by other groups testing OpenAI and is not main-route evidence.
+if (mainRoute) {
+  config.endpoint = { url: "https://www.gstatic.com/generate_204", expected: "204", minBytes: 0 };
+  config.traceEndpoint = { url: "https://www.cloudflare.com/cdn-cgi/trace", expected: "200", minBytes: 100 };
+  config.bodyEndpoint = config.traceEndpoint;
+}
+
+function routeAliveCandidates(candidates, proxies) {
+  return mainRoute ? candidates : filterProviderAliveCandidates(candidates, proxies);
+}
+
 let state = newWatchdogState();
 let stopped = false;
 let urgentRecovery = false;
@@ -186,6 +207,14 @@ let currentNetworkPath = null;
 let networkTransitionUntil = 0;
 let lastNetworkEnvironmentCheckAt = 0;
 let lastSystemProxyCheckAt = 0;
+let networkObservation = null;
+let routeSampleTask = null;
+let pendingRouteSample = null;
+let systemProxyTask = null;
+let currentCheckTask = null;
+let nextCurrentProbeAt = 0;
+const localCommandChildren = new Set();
+let lastProviderConfirmationAt = 0;
 
 function log(level, event, fields = {}) {
   process.stdout.write(`${JSON.stringify({
@@ -206,6 +235,8 @@ function runLocalCommand(command, commandArgs, timeoutMs = 5_000) {
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, LC_ALL: "C" },
     });
+    localCommandChildren.add(child);
+    child.once("close", () => localCommandChildren.delete(child));
     let stdout = "";
     let stderr = "";
     let finished = false;
@@ -273,8 +304,10 @@ async function ensureMacosSystemProxy({ force = false } = {}) {
   let checked = 0;
   let repaired = 0;
   for (const service of config.macosProxyServices) {
+    if (stopped) break;
     const needed = [];
     for (const kind of macosProxyKinds) {
+      if (stopped) break;
       const result = await runLocalCommand(
         config.networkSetupPath,
         [kind.get, service],
@@ -305,6 +338,7 @@ async function ensureMacosSystemProxy({ force = false } = {}) {
 
     const repairedKinds = [];
     for (const kind of needed) {
+      if (stopped) break;
       const result = await runLocalCommand(
         config.networkSetupPath,
         [kind.set, service, desired.server, String(desired.port)],
@@ -349,37 +383,47 @@ async function ensureMacosSystemProxy({ force = false } = {}) {
   return { checked, repaired };
 }
 
+function scheduleSystemProxyCheck(force = false) {
+  if (stopped || systemProxyTask) return;
+  systemProxyTask = ensureMacosSystemProxy({ force })
+    .catch(error => log("warning", "system_proxy_background_failed", { error: error.message }))
+    .finally(() => { systemProxyTask = null; });
+}
+
 async function refreshNetworkEnvironment({ force = false } = {}) {
-  if (process.platform !== "darwin") return false;
-  const now = Date.now();
-  if (!force
-    && now - lastNetworkEnvironmentCheckAt < config.networkEnvironmentIntervalMs) {
-    return false;
-  }
-  lastNetworkEnvironmentCheckAt = now;
-
-  const route = await runLocalCommand(config.routePath, ["-n", "get", "default"]);
-  const nextPath = route.ok ? parseDefaultNetworkPath(route.stdout) : null;
+  if (process.platform !== "darwin" || stopped) return false;
   let changed = false;
-  if (!networkPathInitialized) {
-    networkPathInitialized = true;
-    currentNetworkPath = nextPath;
-    log("info", "network_path_observed", { path: nextPath });
-  } else if (networkPathChanged(currentNetworkPath, nextPath)) {
+  if (pendingRouteSample) {
+    const sample = pendingRouteSample;
+    pendingRouteSample = null;
     const previousPath = currentNetworkPath;
-    currentNetworkPath = nextPath;
-    changed = true;
-    networkTransitionUntil = now + config.networkTransitionGraceMs;
-    state = resetStateForNetworkTransition(state, now);
-    urgentRecovery = true;
-    log("warning", "network_path_changed", {
-      from: previousPath,
-      to: nextPath,
-      graceUntil: networkTransitionUntil,
-    });
+    networkObservation = observeNetworkPath(networkObservation, sample.path, sample.at);
+    currentNetworkPath = networkObservation.current;
+    if (!networkPathInitialized && networkObservation.initialized) {
+      networkPathInitialized = true;
+      log("info", "network_path_observed", { path: currentNetworkPath });
+    } else if (networkObservation.changed) {
+      changed = true;
+      const now = Date.now();
+      networkTransitionUntil = now + config.networkTransitionGraceMs;
+      state = resetStateForNetworkTransition(state, now);
+      urgentRecovery = true;
+      log("warning", "network_path_changed", { from: previousPath, to: currentNetworkPath, graceUntil: networkTransitionUntil });
+    }
   }
-
-  await ensureMacosSystemProxy({ force: force || changed });
+  const now = Date.now();
+  if (!routeSampleTask && (lastNetworkEnvironmentCheckAt === 0
+    || now - lastNetworkEnvironmentCheckAt >= config.networkEnvironmentIntervalMs)) {
+    lastNetworkEnvironmentCheckAt = now;
+    routeSampleTask = runLocalCommand(config.routePath, ["-n", "get", "default"])
+      .then(result => {
+        pendingRouteSample = { path: result.ok ? parseDefaultNetworkPath(result.stdout) : null, at: Date.now() };
+        if (!result.ok) log("warning", "network_path_read_failed", { error: result.error });
+      })
+      .finally(() => { routeSampleTask = null; });
+  }
+  // Only startup and confirmed transitions may force this expensive check.
+  scheduleSystemProxyCheck(changed || (force && lastSystemProxyCheckAt === 0));
   return changed;
 }
 
@@ -435,7 +479,7 @@ function createMihomoRequest(method, requestPath, encodedBody = null) {
   });
 }
 
-function mihomoRequest(method, requestPath, body, timeoutMs = 15_000) {
+function mihomoRequest(method, requestPath, body, timeoutMs = 5_000) {
   return new Promise((resolve, reject) => {
     const encodedBody = body == null ? null : JSON.stringify(body);
     let request;
@@ -549,6 +593,7 @@ function currentProbeDelay() {
 }
 
 async function readProxyAlive(name) {
+  if (mainRoute) return null;
   const proxy = await mihomoRequest(
     "GET",
     `/proxies/${encodeURIComponent(name)}`,
@@ -625,12 +670,13 @@ async function curlOpenAIPathProbe(proxyUrl = config.proxyUrl) {
   };
 }
 
-async function probeNodePath(name) {
+async function probeNodePath(name, qualificationEndpoint = null) {
   const requestPath = `/proxies/${encodeURIComponent(config.groupName)}`;
   const before = await mihomoRequest("GET", requestPath);
   const candidates = [...new Set(before.all || [])].sort();
-  const proxyUrl = nodeProbeProxyUrl(name, candidates);
-  const result = await curlOpenAIPathProbe(proxyUrl);
+  const proxyUrl = nodeProbeProxyUrl(name, candidates, config.probeBasePort);
+  const entry = qualificationEndpoint ? await curlProbe(qualificationEndpoint, proxyUrl) : null;
+  const result = entry && !entry.ok ? entry : await curlOpenAIPathProbe(proxyUrl);
   const after = await mihomoRequest("GET", requestPath);
   const currentCandidates = [...new Set(after.all || [])].sort();
   if (JSON.stringify(candidates) !== JSON.stringify(currentCandidates)) {
@@ -689,6 +735,22 @@ async function preflightCandidate(name, reason) {
 }
 
 async function checkCurrent() {
+  if (currentCheckTask) return currentCheckTask;
+  currentCheckTask = performCurrentCheck().finally(() => {
+    nextCurrentProbeAt = Date.now() + currentProbeDelay();
+    currentCheckTask = null;
+  });
+  return currentCheckTask;
+}
+
+async function serviceCurrentDeadline() {
+  if (stopped || onceMode || nextCurrentProbeAt === 0 || Date.now() < nextCurrentProbeAt) return;
+  await refreshNetworkEnvironment();
+  log("info", "current_probe_deadline_serviced", { overdueMs: Math.max(0, Date.now() - nextCurrentProbeAt) });
+  await checkCurrent();
+}
+
+async function performCurrentCheck() {
   const node = state.current;
   const transitionProbe = networkTransitionActive();
   let reportedProviderAlive = null;
@@ -704,13 +766,18 @@ async function checkCurrent() {
   let result;
   if (
     reportedProviderAlive === false
-    && (transitionProbe || latestPathProbeWasSuccessful(
+    && (transitionProbe
+      || (state.providerUnhealthyAt > 0
+        && Date.now() - state.providerUnhealthyAt >= 30_000
+        && Date.now() - lastProviderConfirmationAt >= 30_000)
+      || latestPathProbeWasSuccessful(
       state,
       node,
       Date.now(),
       config.providerFalseConfirmationWindowMs,
     ))
   ) {
+    lastProviderConfirmationAt = Date.now();
     log("warning", "provider_health_confirmation_started", {
       node,
       reportedAlive: false,
@@ -838,6 +905,12 @@ async function checkCurrent() {
 }
 
 async function probeNode(name, endpoint = config.endpoint) {
+  // Do not mutate Mihomo's shared alive cache using a different service's URL.
+  if (mainRoute) {
+    const group = await mihomoRequest("GET", `/proxies/${encodeURIComponent(config.groupName)}`);
+    const result = await curlProbe(endpoint, nodeProbeProxyUrl(name, group.all || [], config.probeBasePort));
+    return { ...result, name, delay: result.totalMs, testedAt: Date.now() };
+  }
   if (!endpoint?.url || !endpoint.expected) {
     throw new Error("Invalid node probe endpoint");
   }
@@ -985,8 +1058,8 @@ async function qualifyCandidates(names) {
     const samples = [];
     const endpoints = [config.endpoint, config.traceEndpoint, config.endpoint];
     for (let attempt = 0; attempt < config.qualificationPasses; attempt += 1) {
-      const shortProbe = await probeNode(name, endpoints[attempt % endpoints.length]);
-      const result = shortProbe.ok ? await probeNodePath(name) : shortProbe;
+      await serviceCurrentDeadline();
+      const result = await probeNodePath(name, endpoints[attempt % endpoints.length]);
       samples.push(result);
       recordCandidateProbe(result);
       if (!result.ok) break;
@@ -1037,7 +1110,9 @@ async function verifySelectedCandidate(name, probeCount = config.postSwitchProbe
       });
     }
     state = recordProviderHealth(state, providerAlive);
-    const result = providerAlive === false
+    const result = providerAlive === false && !latestPathProbeWasSuccessful(
+      state, name, Date.now(), config.providerFalseConfirmationWindowMs,
+    )
       ? {
           ok: false,
           status: "provider_unhealthy",
@@ -1046,6 +1121,9 @@ async function verifySelectedCandidate(name, probeCount = config.postSwitchProbe
           error: "Mihomo reports this proxy as unavailable",
         }
       : await curlOpenAIPathProbe();
+    if (result.ok && providerAlive === false) {
+      state = recordProviderHealth(state, true);
+    }
     const testedAt = Date.now();
     state = recordCurrentProbe(state, result, testedAt);
     if (isRealPathProbeResult(result)) {
@@ -1224,14 +1302,15 @@ async function recover(reason) {
 
   const { candidates } = await refreshGroup();
   let proxySnapshot = await mihomoRequest("GET", "/proxies");
-  let providerAliveCandidates = filterProviderAliveCandidates(
+  let providerAliveCandidates = routeAliveCandidates(
     candidates,
     proxySnapshot?.proxies,
   );
   const providerAliveBeforeRefresh = providerAliveCandidates.length;
   let refreshBatch = [];
   let refreshedQualified = [];
-  if (providerAliveCandidates.length < config.providerRefreshAliveFloor) {
+  if (providerAliveCandidates.length < config.providerRefreshAliveFloor
+    || state.recoveryExhaustions > 0) {
     refreshBatch = pickProviderRefreshBatch(
       candidates,
       proxySnapshot?.proxies,
@@ -1250,12 +1329,16 @@ async function recover(reason) {
         alive: providerAliveCandidates.length,
         candidates: refreshBatch,
       });
+      state = recordProviderRefreshAttempts(state, refreshBatch);
       refreshedQualified = await qualifyCandidates(refreshBatch);
       proxySnapshot = await mihomoRequest("GET", "/proxies");
-      providerAliveCandidates = filterProviderAliveCandidates(
+      providerAliveCandidates = routeAliveCandidates(
         candidates,
         proxySnapshot?.proxies,
       );
+      providerAliveCandidates = [...new Set([
+        ...providerAliveCandidates, ...refreshedQualified.map((result) => result.name),
+      ])];
       log(
         providerAliveCandidates.length > providerAliveBeforeRefresh
           ? "info"
@@ -1380,6 +1463,8 @@ async function recover(reason) {
       tested.push(...batch);
 
       const qualified = await qualifyCandidates(batch);
+      await serviceCurrentDeadline();
+      if (!currentRecoveryReason()) return false;
       const ranked = rankFreshSuccesses(
         qualified,
         state,
@@ -1568,7 +1653,7 @@ async function runRadar(candidates) {
 
 async function runHotStandbyRadar(candidates) {
   const proxySnapshot = await mihomoRequest("GET", "/proxies");
-  const providerAliveCandidates = filterProviderAliveCandidates(
+  const providerAliveCandidates = routeAliveCandidates(
     candidates,
     proxySnapshot?.proxies,
   );
@@ -1679,7 +1764,7 @@ function notePassiveError(sourceMessage) {
 }
 
 function startLogMonitor() {
-  if (stopped || onceMode) return;
+  if (stopped || onceMode || mainRoute) return;
   let request;
   try {
     request = createMihomoRequest(
@@ -1730,6 +1815,7 @@ async function run() {
     current: group.now,
     candidates: candidates.length,
     endpoint: config.endpoint.url,
+    routeProfile: mainRoute ? "main" : "openai",
     macosSystemProxySync: config.macosSystemProxySync,
     macosProxyServices: config.macosSystemProxySync
       ? config.macosProxyServices
@@ -1745,19 +1831,23 @@ async function run() {
     await runHotStandbyRadar(candidates);
   }
   await saveState();
-  if (onceMode) return;
+  if (onceMode) {
+    if (routeSampleTask) await routeSampleTask;
+    await refreshNetworkEnvironment();
+    if (systemProxyTask) await systemProxyTask;
+    return;
+  }
 
   startLogMonitor();
-  let nextCurrentProbeAt = Date.now() + currentProbeDelay();
+  nextCurrentProbeAt = Date.now() + currentProbeDelay();
   let nextActivityAt = Date.now() + config.activityIntervalMs;
   let nextRadarAt = Date.now();
   let nextHotStandbyAt = Date.now();
 
   while (!stopped) {
     try {
-      await refreshNetworkEnvironment({
-        force: urgentRecovery || currentRecoveryReason() !== null,
-      });
+      await refreshNetworkEnvironment();
+      await serviceCurrentDeadline();
       const { candidates: latestCandidates } = await refreshGroup();
       const now = Date.now();
       if (now >= nextActivityAt) {
@@ -1772,10 +1862,9 @@ async function run() {
         if (currentRecoveryReason() === "passive_transport_errors") {
           recovered = await maybeRecover();
         } else {
-          await checkCurrent();
+          await serviceCurrentDeadline();
           recovered = await maybeRecover();
         }
-        nextCurrentProbeAt = Date.now() + currentProbeDelay();
       } else if (state.nextRecoveryAt > 0 && now >= state.nextRecoveryAt) {
         state.nextRecoveryAt = 0;
         await checkCurrent();
@@ -1797,6 +1886,7 @@ async function run() {
         && !networkTransitionActive()
         && Date.now() >= nextHotStandbyAt) {
         await runHotStandbyRadar(latestCandidates);
+        await serviceCurrentDeadline();
         nextHotStandbyAt = Date.now() + config.hotStandbyIntervalMs;
       }
 
@@ -1804,6 +1894,7 @@ async function run() {
         && !networkTransitionActive()
         && Date.now() >= nextRadarAt) {
         await runRadar(latestCandidates);
+        await serviceCurrentDeadline();
         nextRadarAt = Date.now() + config.radarIntervalMs;
       }
       await saveState();
@@ -1817,6 +1908,7 @@ async function run() {
 async function shutdown(signal) {
   if (stopped) return;
   stopped = true;
+  for (const child of localCommandChildren) child.kill("SIGTERM");
   logRequest?.destroy();
   try {
     await saveState();

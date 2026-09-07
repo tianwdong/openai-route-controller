@@ -35,15 +35,15 @@
 - 候选池全部冷却，但故障理由还不足以启用严格冷却池复用；
 - Mihomo provider 状态长期未更新，手动测速刷新了其 `alive` 数据。
 
-新版在 provider-alive 候选少于 3 个时会自动执行同类刷新，但每轮最多只测 3 个，防止全池并发测速反过来拖垮代理。查看：
+新版在 provider-alive 候选少于 3 个时会每轮独立验证最多 3 个陈旧候选，优先扩大覆盖，再重试已检查节点；不依赖共享测速缓存恢复。查看：
 
 - `provider_cache_refresh_started`：本轮主动刷新的候选；
-- `provider_cache_refresh_complete`：刷新前后的 alive 数量；
+- `provider_cache_refresh_complete`：恢复扫描前后的可参与候选数量；
 - `provider_candidate_filter`：刷新后实际允许进入严格验证的候选；
 - `recovery_exhausted`：本轮全失败后的下次重试时间；
 - `recovery_woken_by_hot_standby`：热备恢复后是否提前结束退避。
 
-即使刷新探针成功，只要 Mihomo 仍未把节点标成 alive，控制器也不会直接切过去。
+共享 alive=false 不再否决已通过独立资格检查的候选，但候选仍须遵守冷却、切换前即时复核及切换后的完整路径检查。
 
 ## Codex 一直重连，但控制器探针正常
 

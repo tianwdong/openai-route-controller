@@ -27,7 +27,7 @@
 
 | 行为 | 默认值 |
 |---|---|
-| provider 缓存刷新触发 | provider-alive 候选少于 3 个 |
+| provider 缓存刷新触发 | provider-alive 候选少于 3 个，或上一轮恢复已耗尽 |
 | 单轮 provider 缓存刷新 | 最多 3 个候选，同一候选至少间隔 30 秒 |
 | provider 不可用退避 | 10、30、30 秒；热备就绪可提前唤醒 |
 | 严重故障／活跃恢复退避 | 最多 60 秒；新严重故障可打断轻故障退避，两轮至少间隔 10 秒 |
@@ -36,7 +36,7 @@
 | macOS 切网保护 | 20 秒内不累计当前路径失败或被动错误；每 3 秒复核原节点，成功后提前结束 |
 | 旧连接排空 | 记录旧出口连接并忽略其后续错误，不主动删除连接 |
 
-provider 刷新不会绕过 `alive:true`、资格探针、切换后复核、冷却或回滚规则。
+provider 恢复扫描优先选择未扫描、最久未扫描的候选，单独记录每次尝试，避免基础设施错误或地区分桶导致反复占用名额。候选通过独立监听完成三轮资格验证后，即使共享 `alive:false` 未更新，也可进入正常恢复候选池；冷却、切换前即时复核、切换后验证和回滚规则仍然有效。
 
 冷候选扫描在启动后执行一轮，之后每 60 秒重查最久未测的候选：最近 2 分钟有 OpenAI 流量时每轮 1 个，空闲时每轮 2 个。持续使用不会无限暂停扫描；当前节点和仍在冷却期的节点不进入这一后台扫描。
 
@@ -80,3 +80,51 @@ node controller.mjs
 - 无参数：实时控制 Selector。
 
 首次上线必须先通过 `npm run verify` 和 `--once --shadow`。
+
+## Independent main-route profile
+
+`ROUTE_PROFILE=main` reuses the recovery state machine for general proxy traffic.
+`ROUTE_GROUP` overrides its default `主代理自动选择` selector. This instance has a
+separate state directory (`Main Route Controller` on macOS), process and logs.
+Its current-route probe uses loopback port 18100 bound to that selector; isolated
+candidates use sorted, deduplicated names at ports 18000 + index. The listener
+configuration must match this mapping and must not overlap the OpenAI listeners.
+
+This profile checks HTTPS gstatic 204 and a complete Cloudflare trace 200 response
+with at least 100 bytes. It ignores the shared Mihomo `alive` cache and performs
+its own HTTP probes instead of writing to the shared native delay cache. It does
+not consume OpenAI passive-error logs or manage system proxy settings. Current
+traffic observation remains scoped to its own group. These probes test general
+HTTPS reachability, not all websites or long-lived application streams.
+
+The existing qualification, isolated preflight, four post-switch checks, gradual
+cooldowns, recovery backoff, and active/idle cold radar remain in force. The main
+selector is nested under the user's main manual selector; switching that outer
+selector to a manual option remains possible. OpenAI remains the default profile
+and its installed service need not be restarted when deploying the main instance.
+
+当当前节点被 provider 持续判死且缺少新鲜成功证据时，每约 30 秒执行一次真实路径复核，避免仅凭旧缓存持续返回 provider_unhealthy。被动错误触发的缓存检查仍不应计作真实网络请求失败。
+
+## Monitoring scheduling and route debounce
+
+A new default interface/gateway must remain observed for 10 seconds before it
+resets route-specific recovery state. A failed route read or a sample gap longer
+than 15 seconds breaks confirmation; it does not erase the last confirmed route.
+The initial valid observation establishes a baseline without resetting failures.
+
+Route reads and system-proxy checks each have at most one background job in
+flight. Errors do not force a fresh system-proxy scan on every controller loop.
+State transitions from route observations remain on the controller's serial flow.
+
+Current-path monitoring has an independent due time. Candidate qualification
+checks this deadline between attempts and batches, and background radar yields
+to an overdue current check. Repeated passive errors do not keep postponing that
+deadline. Current checks are single-flight; selector mutation and post-switch
+validation remain serial. Ordinary local Mihomo requests time out after 5 seconds;
+native delay tests retain their explicit timeout. The design is cooperative:
+one in-flight request can still delay a scheduled check; it is not a hard real-time
+guarantee. Post-switch probes also count as current-path monitoring.
+
+`current_probe_deadline_serviced` includes `overdueMs` to expose delay, and
+`network_path_read_failed` reports a failed route command without calling it a
+confirmed network transition.

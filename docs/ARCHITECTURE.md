@@ -16,7 +16,7 @@ Clash 全局脚本创建一个普通 Selector，并为每个候选创建一个�
 
 `alive` 和 delay API 用于快速排除明显不可达节点，但不单独证明 OpenAI 路径可用。若当前节点刚在 60 秒内完成过完整路径探针，单次 `alive:false` 会触发一次真实路径确认；确认成功则记录 `provider_health_false_overridden`，确认失败才熔断。没有执行真实请求时生成的 `provider_unhealthy` 只属于 provider 信号，不得写入 `pathEvents`，避免健康缓存过期被误算成多次真实路径失败。
 
-当 provider-alive 候选少于 3 个时，恢复流程会从完整候选池中分散选取最多 3 个陈旧 `alive:false` 候选，调用 delay API 主动刷新 Mihomo 健康缓存。刷新只让节点重新进入候选资格判断；节点仍须满足 provider-alive、3 次资格探针以及切换后的完整路径复核，不能因为刷新成功直接被选中。
+当 provider-alive 候选少于 3 个，或上一轮恢复已耗尽时，恢复流程每轮检查最多 3 个陈旧候选。排序优先尚未扫描和最久未扫描，独立记录 lastProviderRefreshAt，避免历史评分或地区分桶让少数失败节点反复占用名额。资格检查的短请求和完整路径均使用固定节点监听器，不依赖 delay API 成功。通过三轮独立资格验证的节点可在共享 alive 仍为 false 时进入恢复候选池，之后继续遵守冷却、即时复核、切换后四次验证和回滚规则；不会直接切换或修改共享健康缓存。
 
 ### OpenAI 入口探针
 
@@ -96,7 +96,7 @@ macOS 的系统代理按网络服务保存。有线服务启用了代理，并�
   │
   ├─ Mihomo alive:false ────────> 存活池不足时，最多刷新 3 个
   │                                      │
-  │                                      ├─ 刷新后仍不可达 ──> 本轮排除
+  │                                      ├─ 独立资格未通过 ──> 本轮排除
   │                                      └─ 恢复可达 ────────> 回到严格资格验证
   │
   ├─ 热备且完整路径历史新鲜、干净 ──────> 1 次即时复核
@@ -159,3 +159,14 @@ macOS 的系统代理按网络服务保存。有线服务启用了代理，并�
 - 同一节点重复隔离次数。
 
 改变入口 URL、预期状态码、响应体下限、失败阈值、隔离时间或复核次数时，必须同步更新测试和 README。
+
+### Debounced environment checks and monitoring deadlines
+
+Default-route observation is debounced for 10 seconds and failed reads do not
+trigger a transition. Route commands and system-proxy work run as separate
+single-flight background jobs. Route state changes are applied on the serial
+controller flow. Candidate qualification yields between attempts and batches
+to current monitoring deadlines; overdue checks also run between radar batches.
+Network/selector recovery state is not mutated concurrently by background jobs.
+Long individual requests can delay a checkpoint, but repeated forced system
+checks no longer monopolize the monitoring loop.

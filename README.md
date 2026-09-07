@@ -33,9 +33,9 @@
 | 切换失败 | 回滚至恢复前节点，不把失败候选留在选择器上 |
 | 节点隔离 | 15、30、60 分钟递增；同一冷却期不会被重复延长；连续 30 分钟完整路径成功后降一级，探针间隔不得超过 2 分钟，不提前解除既有隔离 |
 | 冷却池脱困 | 硬故障且普通候选耗尽时，最多取 3 个仍被 Mihomo 标记可达的冷却节点，重新完成严格 3＋4 验证；不是直接复活 |
-| provider 缓存脱困 | 可达候选少于 3 个时，每轮最多主动刷新 3 个 `alive:false` 候选；刷新后仍须进入正常资格验证，绝不直接选中 |
+| provider 缓存脱困 | 可达候选少于 3 个或上一轮恢复耗尽时，每轮独立验证最多 3 个候选，优先未检查者；通过严格验证后可进入候选池，不再被共享 `alive:false` 否决 |
 | 恢复退避 | 空闲间歇故障按 10、30、60、300 秒退避；严重故障或活跃流量最多 60 秒，provider 不可用最多 30 秒；新硬故障可打断旧轻故障退避，但两次恢复至少间隔 10 秒 |
-| macOS 切网保护 | 默认网卡或网关变化后进入 20 秒保护期；先复核原节点，切网抖动不计入节点故障，保护期内暂停候选雷达 |
+| macOS 切网保护 | 新网卡／网关持续被观测 10 秒后才确认，短暂往返与读取失败不重置恢复状态；确认后进入 20 秒保护期 |
 | 旧连接 | 切换后让仍走旧出口的 OpenAI 连接自然排空；排空期间错误不归罪于新节点，不主动删除正在输出的连接 |
 
 完整状态机见 [架构与熔断设计](docs/ARCHITECTURE.md)，环境变量见 [配置参考](docs/CONFIGURATION.md)。
@@ -127,7 +127,7 @@ MACOS_PROXY_SERVICES="Wi-Fi" \
 sh scripts/install-macos.sh
 ```
 
-这是显式开启项。开启后，控制器每 30 秒检查这些网络服务，并在默认网卡变化时立即检查；HTTP、HTTPS 或 SOCKS 代理被关闭或偏离 `MIHOMO_PROXY` 时会自动修复。它不修改 DNS、网关、代理绕过列表或其他网络服务。
+这是显式开启项。开启后，控制器每 30 秒在独立后台任务中检查这些网络服务，并在默认网卡变化被确认后补查；HTTP、HTTPS 或 SOCKS 代理被关闭或偏离 `MIHOMO_PROXY` 时会自动修复。它不修改 DNS、网关、代理绕过列表或其他网络服务。
 
 安装器会先运行测试（包含本机 HTTP API 集成测试）和影子验证，然后备份旧文件、安装用户级 LaunchAgent 并启动服务。
 
@@ -172,7 +172,7 @@ rm -rf "$SHADOW_DIR"
 - `candidate_probe_unavailable`：本机探测入口或映射有问题，该结果不处罚候选；
 - `hot_standby_radar.fastReady`：具备新鲜完整路径证据的快速热备；
 - `provider_health_false_overridden`：Mihomo 单次判死被完整路径复核覆盖；
-- `provider_cache_refresh_started`／`provider_cache_refresh_complete`：低存活池正在自动刷新少量 provider 健康缓存；
+- `provider_cache_refresh_started`／`provider_cache_refresh_complete`：低存活池正在独立检查少量陈旧候选；
 - `recovery_woken_by_hot_standby`：热备已恢复，控制器提前结束退避；
 - `current_node_ejected`：当前节点进入隔离；
 - `recovery_candidate_rejected`：候选切换后复核失败并回滚；
@@ -229,3 +229,12 @@ npm run verify
 ## License
 
 [MIT](LICENSE)
+
+### Optional independent main route
+
+An explicit `ROUTE_PROFILE=main` instance can manage a separate main-traffic
+selector using the same recovery state machine. It requires its own state,
+service and loopback probe listeners; it must not share the OpenAI listener map.
+It uses general HTTPS endpoints and ignores shared native health cache values.
+See [configuration](docs/CONFIGURATION.md#independent-main-route-profile) for the
+profile contract and validation limits. The default OpenAI profile is unchanged.

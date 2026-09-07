@@ -21,12 +21,14 @@ import {
   nodeProbeProxyUrl,
   normalizeState,
   networkPathChanged,
+  observeNetworkPath,
   parseDefaultNetworkPath,
   parseNetworkSetupProxy,
   passiveErrorKey,
   pickEmergencyRecoveryBatch,
   pickHotStandbyProbeBatch,
   pickProviderRefreshBatch,
+  recordProviderRefreshAttempts,
   pickRadarBatch,
   pickRecoveryBatch,
   planConnectionDrain,
@@ -1094,4 +1096,45 @@ test("isolated probe ports use the same sorted unique node order as the script",
   assert.equal(nodeProbeProxyUrl("JP-1", candidates), "http://127.0.0.1:17900");
   assert.equal(nodeProbeProxyUrl("TW-2", candidates), "http://127.0.0.1:17901");
   assert.throws(() => nodeProbeProxyUrl("MISSING", candidates), /No isolated probe route/);
+});
+
+
+test("provider recovery visits unseen candidates before retrying favored regions", () => {
+  let state = newWatchdogState(); state.current = "CURRENT";
+  const names = ["TW-6", "JP3-HY2", "JP-1", "JP-2", "JP-4", "JP-5", "US-1TCP"];
+  const proxies = Object.fromEntries(names.map(n => [n, {alive:false}]));
+  const seen = new Set();
+  for (let round=0; round<3; round++) {
+    const now = 100000 + round*60000;
+    const batch = pickProviderRefreshBatch(names, proxies, state, now, {limit:3});
+    for (const name of batch) {
+      if (seen.size < names.length) assert.equal(seen.has(name), false, `repeated ${name} before coverage`);
+      seen.add(name);
+    }
+    state = recordProviderRefreshAttempts(state, batch, now);
+  }
+  assert.equal(seen.size, names.length);
+});
+
+
+test("route debounce ignores flaps and confirms sustained changes", () => {
+  const a={interfaceName:"en8",gateway:"192.0.2.1"};
+  const b={interfaceName:"en0",gateway:"192.0.2.2"};
+  let o=observeNetworkPath(null,a,100000);
+  o=observeNetworkPath(o,b,105000); assert.equal(o.changed,false);
+  o=observeNetworkPath(o,a,110000); assert.deepEqual(o.current,a);
+  o=observeNetworkPath(o,b,115000);
+  o=observeNetworkPath(o,b,120000); assert.equal(o.changed,false);
+  o=observeNetworkPath(o,b,125000); assert.equal(o.changed,true); assert.deepEqual(o.current,b);
+  o=observeNetworkPath(o,b,130000); assert.equal(o.changed,false);
+});
+
+test("failed route reads and long sampling gaps cannot confirm a transition", () => {
+  const a={interfaceName:"en8",gateway:"192.0.2.1"};
+  const b={interfaceName:"en0",gateway:"192.0.2.2"};
+  let o=observeNetworkPath(null,a,100000);
+  o=observeNetworkPath(o,b,105000);
+  o=observeNetworkPath(o,null,110000); assert.deepEqual(o.current,a);
+  o=observeNetworkPath(o,b,115000); assert.equal(o.changed,false);
+  o=observeNetworkPath(o,b,200000); assert.equal(o.changed,false); assert.deepEqual(o.current,a);
 });

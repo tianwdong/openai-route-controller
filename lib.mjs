@@ -17,6 +17,7 @@ function newNodeState() {
     lastSuccessAt: 0,
     lastFailureAt: 0,
     lastProbeAt: 0,
+    lastProviderRefreshAt: 0,
     excludedUntil: 0,
     ejectionCount: 0,
     penaltyRecoveryStartedAt: 0,
@@ -325,10 +326,10 @@ export function rollingPathStats(
   };
 }
 
-export function nodeProbeProxyUrl(name, candidates) {
+export function nodeProbeProxyUrl(name, candidates, basePort = PROBE_BASE_PORT) {
   const index = [...new Set(candidates)].sort().indexOf(name);
   if (index < 0) throw new Error(`No isolated probe route for ${name}`);
-  return `http://127.0.0.1:${PROBE_BASE_PORT + index}`;
+  return `http://127.0.0.1:${basePort + index}`;
 }
 
 export function latestPathProbeWasSuccessful(
@@ -827,6 +828,12 @@ export function pickEmergencyRecoveryBatch(
   return selected;
 }
 
+export function recordProviderRefreshAttempts(state, names, now = Date.now()) {
+  const nodes = { ...state.nodes };
+  for (const name of names) nodes[name] = { ...newNodeState(), ...nodes[name], lastProviderRefreshAt: now };
+  return { ...state, nodes };
+}
+
 export function pickProviderRefreshBatch(
   candidates,
   proxies,
@@ -851,10 +858,12 @@ export function pickProviderRefreshBatch(
       node: { ...newNodeState(), ...(state.nodes[name] || {}) },
     }))
     .filter(({ node }) => (
-      !node.lastProbeAt || now - node.lastProbeAt >= minProbeAgeMs
+      now - Math.max(node.lastProbeAt, node.lastProviderRefreshAt) >= minProbeAgeMs
     ))
     .sort((left, right) => (
-      Number(left.node.excludedUntil > now) - Number(right.node.excludedUntil > now)
+      left.node.lastProviderRefreshAt - right.node.lastProviderRefreshAt
+      || left.node.lastProbeAt - right.node.lastProbeAt
+      || Number(left.node.excludedUntil > now) - Number(right.node.excludedUntil > now)
       || compareNodeHealth(
         left,
         right,
@@ -865,26 +874,7 @@ export function pickProviderRefreshBatch(
       || left.node.lastProbeAt - right.node.lastProbeAt
     ));
 
-  const buckets = new Map();
-  for (const candidate of ranked) {
-    const key = candidateBucket(candidate.name);
-    if (!buckets.has(key)) buckets.set(key, []);
-    buckets.get(key).push(candidate.name);
-  }
-
-  const selected = [];
-  while (selected.length < limit) {
-    let added = false;
-    for (const names of buckets.values()) {
-      const name = names.shift();
-      if (!name) continue;
-      selected.push(name);
-      added = true;
-      if (selected.length === limit) break;
-    }
-    if (!added) break;
-  }
-  return selected;
+  return ranked.slice(0, limit).map(({ name }) => name);
 }
 
 export function pickRadarBatch(candidates, state, now = Date.now(), options = {}) {
@@ -1120,4 +1110,18 @@ export function isOpenAIPathError(message = "") {
   return /OpenAI 自动选择/i.test(message)
     && /(?:-->\s+|DomainSuffix\/)(?:chatgpt\.com|ws\.chatgpt\.com)(?::443|\b)/i.test(message)
     && /error|timeout|deadline|eof|reset|refused|tls|closed|unreachable|forbidden|403/i.test(message);
+}
+
+export function observeNetworkPath(observation, path, now, stableMs = 10_000) {
+  const previous = observation || { current: null, initialized: false };
+  // Failed reads and sampling gaps cannot confirm a route transition.
+  if (!path) return { ...previous, pending: null, since: 0, lastObservedAt: now, changed: false };
+  if (!previous.initialized) return { current: path, initialized: true, pending: null, since: 0, lastObservedAt: now, changed: false };
+  if (!networkPathChanged(previous.current, path)) return { ...previous, pending: null, since: 0, lastObservedAt: now, changed: false };
+  const continuous = previous.pending && !networkPathChanged(previous.pending, path)
+    && now - previous.lastObservedAt <= 15_000;
+  if (continuous && now - previous.since >= stableMs) {
+    return { current: path, initialized: true, pending: null, since: 0, lastObservedAt: now, changed: true };
+  }
+  return { ...previous, pending: path, since: continuous ? previous.since : now, lastObservedAt: now, changed: false };
 }
