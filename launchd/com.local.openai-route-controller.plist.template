@@ -22,6 +22,12 @@
     <string>__MIHOMO_PROXY__</string>
     <key>OPENAI_GROUP</key>
     <string>__OPENAI_GROUP__</string>
+    <key>MACOS_SYSTEM_PROXY_SYNC</key>
+    <string>__MACOS_SYSTEM_PROXY_SYNC__</string>
+    <key>MACOS_PROXY_SERVICES</key>
+    <string>__MACOS_PROXY_SERVICES__</string>
+    <key>NETWORK_TRANSITION_GRACE_MS</key>
+    <string>__NETWORK_TRANSITION_GRACE_MS__</string>
     <key>STATE_PATH</key>
     <string>__INSTALL_DIR__/state.json</string>
     <key>CURL_PATH</key>

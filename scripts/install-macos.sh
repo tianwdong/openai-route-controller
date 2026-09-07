@@ -8,6 +8,9 @@ PLIST_PATH=${PLIST_PATH:-"$HOME/Library/LaunchAgents/com.local.openai-route-cont
 MIHOMO_SOCKET=${MIHOMO_SOCKET:-/tmp/verge/verge-mihomo.sock}
 MIHOMO_PROXY=${MIHOMO_PROXY:-http://127.0.0.1:7897}
 OPENAI_GROUP=${OPENAI_GROUP:-OpenAI 自动选择}
+MACOS_SYSTEM_PROXY_SYNC=${MACOS_SYSTEM_PROXY_SYNC:-0}
+MACOS_PROXY_SERVICES=${MACOS_PROXY_SERVICES:-Wi-Fi}
+NETWORK_TRANSITION_GRACE_MS=${NETWORK_TRANSITION_GRACE_MS:-20000}
 SERVICE_ID="com.local.openai-route-controller"
 
 if [ "$(uname -s)" != "Darwin" ]; then
@@ -44,6 +47,9 @@ trap 'rm -rf "$SHADOW_DIR"' EXIT HUP INT TERM
 MIHOMO_SOCKET="$MIHOMO_SOCKET" \
 MIHOMO_PROXY="$MIHOMO_PROXY" \
 OPENAI_GROUP="$OPENAI_GROUP" \
+MACOS_SYSTEM_PROXY_SYNC="$MACOS_SYSTEM_PROXY_SYNC" \
+MACOS_PROXY_SERVICES="$MACOS_PROXY_SERVICES" \
+NETWORK_TRANSITION_GRACE_MS="$NETWORK_TRANSITION_GRACE_MS" \
 STATE_PATH="$SHADOW_DIR/state.json" \
 CURL_PATH="$CURL_PATH" \
 "$NODE_PATH" "$REPO_DIR/controller.mjs" --once --shadow
@@ -76,6 +82,9 @@ sed \
   -e "s|__MIHOMO_SOCKET__|$(escape_sed "$MIHOMO_SOCKET")|g" \
   -e "s|__MIHOMO_PROXY__|$(escape_sed "$MIHOMO_PROXY")|g" \
   -e "s|__OPENAI_GROUP__|$(escape_sed "$OPENAI_GROUP")|g" \
+  -e "s|__MACOS_SYSTEM_PROXY_SYNC__|$(escape_sed "$MACOS_SYSTEM_PROXY_SYNC")|g" \
+  -e "s|__MACOS_PROXY_SERVICES__|$(escape_sed "$MACOS_PROXY_SERVICES")|g" \
+  -e "s|__NETWORK_TRANSITION_GRACE_MS__|$(escape_sed "$NETWORK_TRANSITION_GRACE_MS")|g" \
   -e "s|__CURL_PATH__|$(escape_sed "$CURL_PATH")|g" \
   "$REPO_DIR/launchd/com.local.openai-route-controller.plist.template" \
   > "$PLIST_TEMP"

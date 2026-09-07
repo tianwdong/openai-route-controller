@@ -15,12 +15,18 @@ import {
   hasRecentTraffic,
   isGroupConnection,
   isOpenAIPathError,
+  isRealPathProbeResult,
   latestPathProbeWasSuccessful,
   newWatchdogState,
+  nodeProbeProxyUrl,
   normalizeState,
+  networkPathChanged,
+  parseDefaultNetworkPath,
+  parseNetworkSetupProxy,
   passiveErrorKey,
   pickEmergencyRecoveryBatch,
   pickHotStandbyProbeBatch,
+  pickProviderRefreshBatch,
   pickRadarBatch,
   pickRecoveryBatch,
   planConnectionDrain,
@@ -33,11 +39,93 @@ import {
   recordProviderHealth,
   recordSelectionValidation,
   recoveryBackoffDelay,
+  recoveryBackoffDelayForReason,
   recoveryReason,
+  resetStateForNetworkTransition,
   restoreRecoveryOrigin,
   rollingNodeStats,
   rollingPathStats,
+  shouldWakeRecoveryForStandby,
+  systemProxyNeedsRepair,
 } from "./lib.mjs";
+
+test("macOS proxy status exposes disabled or mismatched services", () => {
+  const disabled = parseNetworkSetupProxy([
+    "Enabled: No",
+    "Server: 127.0.0.1",
+    "Port: 7897",
+    "Authenticated Proxy Enabled: 0",
+  ].join("\n"));
+  const desired = { server: "127.0.0.1", port: 7897 };
+
+  assert.deepEqual(disabled, {
+    enabled: false,
+    server: "127.0.0.1",
+    port: 7897,
+  });
+  assert.equal(systemProxyNeedsRepair(disabled, desired), true);
+  assert.equal(
+    systemProxyNeedsRepair({ ...disabled, enabled: true }, desired),
+    false,
+  );
+  assert.equal(parseNetworkSetupProxy("not a proxy status"), null);
+});
+
+test("macOS default-route changes distinguish wired and Wi-Fi paths", () => {
+  const wired = parseDefaultNetworkPath([
+    "   route to: default",
+    "destination: default",
+    "    gateway: 192.0.2.1",
+    "  interface: en8",
+  ].join("\n"));
+  const wifi = parseDefaultNetworkPath([
+    "   route to: default",
+    "destination: default",
+    "    gateway: 192.0.2.1",
+    "  interface: en0",
+  ].join("\n"));
+
+  assert.deepEqual(wired, { interfaceName: "en8", gateway: "192.0.2.1" });
+  assert.deepEqual(wifi, { interfaceName: "en0", gateway: "192.0.2.1" });
+  assert.equal(networkPathChanged(wired, wired), false);
+  assert.equal(networkPathChanged(wired, wifi), true);
+  assert.equal(networkPathChanged(wifi, null), true);
+});
+
+test("a network transition clears only route-specific failure evidence", () => {
+  const state = newWatchdogState();
+  state.current = "JP-1";
+  state.currentSelectedAt = 10_000;
+  state.currentFailures = 3;
+  state.currentFailureStartedAt = 20_000;
+  state.lastFailureAt = 30_000;
+  state.nextRecoveryAt = 90_000;
+  state.recoveryExhaustions = 2;
+  state.providerAlive = false;
+  state.providerUnhealthyAt = 25_000;
+  state.passiveErrors = [{ at: 30_000, key: "old-route" }];
+  state.holdUntil = 120_000;
+  state.nodes["JP-1"] = { pathEvents: [{ at: 30_000, ok: false }] };
+  state.selectionValidation = {
+    from: "JP-2",
+    to: "JP-1",
+    source: "manual",
+    startedAt: 15_000,
+    consecutiveSuccesses: 1,
+  };
+
+  const reset = resetStateForNetworkTransition(state, 40_000);
+
+  assert.equal(reset.current, "JP-1");
+  assert.equal(reset.currentSelectedAt, 40_000);
+  assert.equal(reset.currentFailures, 0);
+  assert.equal(reset.providerAlive, null);
+  assert.deepEqual(reset.passiveErrors, []);
+  assert.equal(reset.holdUntil, 120_000);
+  assert.deepEqual(reset.nodes, state.nodes);
+  assert.equal(reset.selectionValidation.startedAt, 40_000);
+  assert.equal(reset.selectionValidation.consecutiveSuccesses, 0);
+});
 
 test("a successful current probe clears prior failures", () => {
   let state = newWatchdogState();
@@ -83,6 +171,24 @@ test("a fresh successful full-path probe requires confirmation before trusting p
   );
 });
 
+test("synthetic provider failures never enter full-path history", () => {
+  let state = newWatchdogState();
+  state.current = "JP-1";
+  const synthetic = { ok: false, status: "provider_unhealthy" };
+  const real = { ok: false, status: "000" };
+
+  if (isRealPathProbeResult(synthetic)) {
+    state = recordNodePathProbe(state, state.current, synthetic, 10_000);
+  }
+  assert.equal(state.nodes["JP-1"], undefined);
+
+  if (isRealPathProbeResult(real)) {
+    state = recordNodePathProbe(state, state.current, real, 20_000);
+  }
+  assert.equal(state.nodes["JP-1"].pathEvents.length, 1);
+  assert.equal(state.nodes["JP-1"].pathEvents[0].ok, false);
+});
+
 test("recovery candidates exclude proxies Mihomo already marks unavailable", () => {
   const candidates = filterProviderAliveCandidates(
     ["SG4-HY2", "TW-9", "JP-3", "TW-9"],
@@ -94,6 +200,32 @@ test("recovery candidates exclude proxies Mihomo already marks unavailable", () 
   );
 
   assert.deepEqual(candidates, ["TW-9"]);
+});
+
+test("provider refresh samples a diverse stale subset without trusting it", () => {
+  let state = newWatchdogState();
+  state.current = "JP-1";
+  state = recordNodeProbe(state, "JP-2", { ok: false }, 195_000);
+  state = ejectNode(state, "SG-1", 190_000, [60_000]);
+  const batch = pickProviderRefreshBatch(
+    ["JP-1", "JP-2", "JP3-HY2", "TW-4", "SG-1", "KR-1"],
+    {
+      "JP-1": { alive: false },
+      "JP-2": { alive: false },
+      "JP3-HY2": { alive: false },
+      "TW-4": { alive: false },
+      "SG-1": { alive: false },
+      "KR-1": { alive: true },
+    },
+    state,
+    200_000,
+    { limit: 3, minProbeAgeMs: 10_000 },
+  );
+
+  assert.deepEqual(new Set(batch), new Set(["JP3-HY2", "TW-4", "SG-1"]));
+  assert.equal(batch.includes("JP-1"), false);
+  assert.equal(batch.includes("JP-2"), false);
+  assert.equal(batch.includes("KR-1"), false);
 });
 
 test("candidate qualification requires every separated probe to pass", () => {
@@ -674,6 +806,21 @@ test("hot standbys require three fresh successes spread across time", () => {
   );
 });
 
+test("extra successful radar samples do not erase a standby's established time span", () => {
+  let state = newWatchdogState();
+  state.current = "JP-CURRENT";
+  for (const at of [100_000, 120_000, 140_000, 140_001]) {
+    state = recordNodeProbe(state, "TW-1", { ok: true, delay: 20 }, at);
+  }
+  const options = { requiredPasses: 3, historyWindowMs: 90_000, minSpanMs: 35_000 };
+  assert.deepEqual(rankHotStandbys(["TW-1"], state, 140_001, options), ["TW-1"]);
+  state = recordNodeProbe(state, "TW-1", { ok: false }, 145_000);
+  for (const at of [150_000, 150_001, 150_002]) {
+    state = recordNodeProbe(state, "TW-1", { ok: true, delay: 20 }, at);
+  }
+  assert.deepEqual(rankHotStandbys(["TW-1"], state, 150_002, options), []);
+});
+
 test("radar-only hot standbys need recent clean full-path history for fast handover", () => {
   let state = newWatchdogState();
   state.current = "JP-2";
@@ -742,6 +889,35 @@ test("recovery exhaustion uses bounded exponential backoff", () => {
   assert.equal(recoveryBackoffDelay(9, schedule), 300_000);
 });
 
+test("provider-cache outages retry at most every thirty seconds", () => {
+  const options = {
+    defaultScheduleMs: [10_000, 30_000, 60_000, 300_000],
+    providerUnavailableScheduleMs: [10_000, 30_000, 30_000],
+  };
+  assert.equal(
+    recoveryBackoffDelayForReason(9, "provider_health_unavailable", options),
+    30_000,
+  );
+  assert.equal(
+    recoveryBackoffDelayForReason(9, "slow_current_path_failures", options),
+    300_000,
+  );
+});
+
+test("a ready standby wakes only an unhealthy node from active backoff", () => {
+  const state = newWatchdogState();
+  state.providerAlive = false;
+  state.nextRecoveryAt = 300_000;
+
+  assert.equal(shouldWakeRecoveryForStandby(state, ["TW-7"], 100_000), true);
+  assert.equal(shouldWakeRecoveryForStandby(state, [], 100_000), false);
+  assert.equal(shouldWakeRecoveryForStandby(state, ["TW-7"], 300_000), false);
+
+  state.providerAlive = true;
+  state.currentFailures = 0;
+  assert.equal(shouldWakeRecoveryForStandby(state, ["TW-7"], 100_000), false);
+});
+
 test("passive matching only accepts real OpenAI group traffic", () => {
   assert.equal(
     isOpenAIPathError("[TCP] dial OpenAI 自动选择 (match DomainSuffix/chatgpt.com) error: context deadline exceeded"),
@@ -801,18 +977,121 @@ test("connection draining preserves only established routes on old group nodes",
   );
 });
 
-test("old cumulative-health state is not reused", () => {
-  const state = normalizeState({ version: 5, current: "JP-1", passiveErrors: [] });
-  assert.equal(state.version, 6);
+test("old path-history state is not reused", () => {
+  const state = normalizeState({ version: 6, current: "JP-1", passiveErrors: [] });
+  assert.equal(state.version, 7);
   assert.equal(state.current, null);
   assert.deepEqual(state.nodes, {});
 });
 
 test("current-version state preserves bounded recovery backoff progress", () => {
   const state = normalizeState({
-    version: 6,
+    version: 7,
     recoveryExhaustions: 2,
     nodes: {},
   });
   assert.equal(state.recoveryExhaustions, 2);
+});
+
+test("continuous real-path failure takes precedence over the intermittent window", () => {
+  let state = newWatchdogState();
+  state.current = "JP-BAD";
+  state.currentSelectedAt = 1_000;
+  for (const at of [10_000, 30_000, 50_000, 70_000]) {
+    state = recordCurrentProbe(state, { ok: false }, at);
+    state = recordNodePathProbe(state, state.current, { ok: false }, at);
+  }
+  const reason = recoveryReason(state, 70_000);
+  assert.equal(reason, "hard_current_probe_failures");
+  assert.equal(allowsEmergencyCoolingReuse(reason), true);
+});
+
+test("a new hard outage wakes mild backoff once without bypassing the retry floor", () => {
+  const state = newWatchdogState();
+  state.lastRecoveryAt = 100_000;
+  state.lastRecoveryReason = "intermittent_current_path_failures";
+  state.nextRecoveryAt = 400_000;
+  state.providerAlive = false;
+  state.providerUnhealthyAt = 105_000;
+  assert.equal(recoveryReason(state, 109_999), null);
+  assert.equal(recoveryReason(state, 110_000), "provider_health_unavailable");
+  state.lastRecoveryReason = "provider_health_unavailable";
+  assert.equal(recoveryReason(state, 120_000), null);
+});
+
+test("confirmed outages and active recovery never use five-minute backoff", () => {
+  assert.equal(recoveryBackoffDelayForReason(8, "hard_current_probe_failures"), 60_000);
+  assert.equal(recoveryBackoffDelayForReason(8, "passive_transport_errors"), 60_000);
+  assert.equal(recoveryBackoffDelayForReason(8, "intermittent_current_path_failures", {
+    activeTraffic: true,
+  }), 60_000);
+  assert.equal(recoveryBackoffDelayForReason(8, "intermittent_current_path_failures"), 300_000);
+});
+
+test("one historical failure does not rank a proven route below an unknown route", () => {
+  let state = newWatchdogState();
+  for (let index = 0; index < 100; index += 1) {
+    state = recordNodePathProbe(state, "TW-PROVEN", { ok: index !== 0 }, 100_000 + index);
+  }
+  const ranked = rankFreshSuccesses(
+    ["JP-UNKNOWN", "TW-PROVEN"].map((name) => ({ name, ok: true, testedAt: 101_000 })),
+    state, 101_000,
+  );
+  assert.equal(ranked[0].name, "TW-PROVEN");
+});
+
+test("old success volume cannot conceal a new failing route", () => {
+  let state = newWatchdogState();
+  for (let index = 0; index < 100; index += 1) {
+    state = recordNodePathProbe(state, "JP-OLD", { ok: true }, 1_000_000 + index);
+  }
+  state = recordNodePathProbe(state, "JP-OLD", { ok: false }, 19_000_000);
+  for (const at of [18_960_000, 18_980_000, 19_000_000]) {
+    state = recordNodePathProbe(state, "TW-RECENT", { ok: true }, at);
+  }
+  const ranked = rankFreshSuccesses(
+    ["JP-OLD", "TW-RECENT"].map((name) => ({ name, ok: true, testedAt: 19_000_000 })),
+    state, 19_000_000,
+  );
+  assert.equal(ranked[0].name, "TW-RECENT");
+});
+
+test("sustained full-path recovery lowers one penalty level without shortening isolation", () => {
+  let state = newWatchdogState();
+  for (let index = 0; index < 3; index += 1) state = ejectNode(state, "TW-1", 1_000_000);
+  const excludedUntil = state.nodes["TW-1"].excludedUntil;
+  for (let at = 1_000_001; at <= 2_800_001; at += 60_000) {
+    state = recordNodePathProbe(state, "TW-1", { ok: true }, at);
+  }
+  assert.equal(state.nodes["TW-1"].ejectionCount, 2);
+  assert.equal(state.nodes["TW-1"].excludedUntil, excludedUntil);
+  state = recordNodePathProbe(state, "TW-1", { ok: true }, 2_800_002);
+  assert.equal(state.nodes["TW-1"].ejectionCount, 2);
+});
+
+test("probe gaps, failures and radar successes cannot forgive a route penalty", () => {
+  let state = ejectNode(newWatchdogState(), "TW-1", 1_000_000);
+  state = recordNodePathProbe(state, "TW-1", { ok: true }, 1_000_001);
+  state = recordNodePathProbe(state, "TW-1", { ok: true }, 3_000_000);
+  assert.equal(state.nodes["TW-1"].penaltyRecoveryStartedAt, 3_000_000);
+  state = recordNodePathProbe(state, "TW-1", { ok: false }, 3_010_000);
+  assert.equal(state.nodes["TW-1"].penaltyRecoveryStartedAt, 0);
+  for (let at = 3_020_000; at < 5_000_000; at += 60_000) {
+    state = recordNodeProbe(state, "TW-1", { ok: true }, at);
+  }
+  assert.equal(state.nodes["TW-1"].ejectionCount, 1);
+});
+
+test("a missing probe listener is not evidence against a candidate", () => {
+  const state = newWatchdogState();
+  const result = { ok: false, status: "000", infrastructureError: true };
+  assert.equal(isRealPathProbeResult(result), false);
+  assert.equal(recordNodePathProbe(state, "TW-1", result, 100_000), state);
+});
+
+test("isolated probe ports use the same sorted unique node order as the script", () => {
+  const candidates = ["TW-2", "JP-1", "TW-2"];
+  assert.equal(nodeProbeProxyUrl("JP-1", candidates), "http://127.0.0.1:17900");
+  assert.equal(nodeProbeProxyUrl("TW-2", candidates), "http://127.0.0.1:17901");
+  assert.throws(() => nodeProbeProxyUrl("MISSING", candidates), /No isolated probe route/);
 });

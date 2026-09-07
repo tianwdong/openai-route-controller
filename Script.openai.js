@@ -24,6 +24,28 @@ function main(config, profileName) {
     proxies: candidates,
   });
 
+  const probeNodes = [...new Set(candidates)].sort();
+  const probeBasePort = 17900;
+  const listenerPrefix = "openai-route-probe-";
+  const listeners = (Array.isArray(config.listeners) ? config.listeners : [])
+    .filter((listener) => !listener.name?.startsWith(listenerPrefix));
+  for (const [index, name] of probeNodes.entries()) {
+    const port = probeBasePort + index;
+    if (listeners.some((listener) => Number(listener.port) === port)) {
+      throw new Error(`OpenAI probe port ${port} is already configured`);
+    }
+    listeners.push({
+      name: `${listenerPrefix}${index}`,
+      type: "mixed",
+      listen: "127.0.0.1",
+      port,
+      udp: false,
+      users: [],
+      proxy: name,
+    });
+  }
+  config.listeners = listeners;
+
   config.profile = {
     ...(config.profile || {}),
     "store-selected": true,

@@ -1,8 +1,12 @@
-export const WATCHDOG_STATE_VERSION = 6;
+export const WATCHDOG_STATE_VERSION = 7;
+export const PROBE_BASE_PORT = 17900;
 
 const DEFAULT_ROLLING_WINDOW_MS = 10 * 60_000;
 const DEFAULT_PATH_HISTORY_WINDOW_MS = 6 * 60 * 60_000;
 const DEFAULT_REENTRY_SUCCESSES = 3;
+const PATH_SCORE_HALF_LIFE_MS = 30 * 60_000;
+const PENALTY_RECOVERY_MS = 30 * 60_000;
+const PENALTY_RECOVERY_MAX_GAP_MS = 2 * 60_000;
 
 function newNodeState() {
   return {
@@ -15,6 +19,7 @@ function newNodeState() {
     lastProbeAt: 0,
     excludedUntil: 0,
     ejectionCount: 0,
+    penaltyRecoveryStartedAt: 0,
     probeEvents: [],
     pathEvents: [],
   };
@@ -30,6 +35,7 @@ export function newWatchdogState() {
     lastSuccessAt: 0,
     lastFailureAt: 0,
     lastRecoveryAt: 0,
+    lastRecoveryReason: null,
     nextRecoveryAt: 0,
     recoveryExhaustions: 0,
     holdUntil: 0,
@@ -78,6 +84,65 @@ export function normalizeState(saved) {
       : null,
     passiveErrors: Array.isArray(saved.passiveErrors) ? saved.passiveErrors : [],
     nodes,
+  };
+}
+
+export function parseNetworkSetupProxy(output = "") {
+  const enabled = output.match(/^Enabled:\s*(Yes|No)\s*$/im)?.[1];
+  const server = output.match(/^Server:\s*(.+?)\s*$/im)?.[1];
+  const port = Number(output.match(/^Port:\s*(\d+)\s*$/im)?.[1]);
+  if (!enabled || !server || !Number.isInteger(port)) return null;
+  return {
+    enabled: enabled.toLowerCase() === "yes",
+    server,
+    port,
+  };
+}
+
+export function systemProxyNeedsRepair(current, desired) {
+  return !current
+    || current.enabled !== true
+    || current.server !== desired.server
+    || current.port !== desired.port;
+}
+
+export function parseDefaultNetworkPath(output = "") {
+  const interfaceName = output.match(/^\s*interface:\s*(\S+)\s*$/im)?.[1];
+  const gateway = output.match(/^\s*gateway:\s*(\S+)\s*$/im)?.[1];
+  if (!interfaceName && !gateway) return null;
+  return {
+    interfaceName: interfaceName || null,
+    gateway: gateway || null,
+  };
+}
+
+export function networkPathChanged(previous, current) {
+  if (!previous && !current) return false;
+  if (!previous || !current) return true;
+  return previous.interfaceName !== current.interfaceName
+    || previous.gateway !== current.gateway;
+}
+
+export function resetStateForNetworkTransition(state, now = Date.now()) {
+  return {
+    ...state,
+    currentSelectedAt: now,
+    currentFailures: 0,
+    currentFailureStartedAt: 0,
+    lastFailureAt: 0,
+    nextRecoveryAt: 0,
+    recoveryExhaustions: 0,
+    providerAlive: null,
+    lastRecoveryReason: null,
+    providerUnhealthyAt: 0,
+    passiveErrors: [],
+    selectionValidation: state.selectionValidation
+      ? {
+          ...state.selectionValidation,
+          startedAt: now,
+          consecutiveSuccesses: 0,
+        }
+      : null,
   };
 }
 
@@ -244,12 +309,26 @@ export function rollingPathStats(
   const events = recentPathEvents(node, now, windowMs);
   const successes = events.filter((event) => event.ok).length;
   const failures = events.length - successes;
+  let successWeight = 0;
+  let totalWeight = 0;
+  for (const event of events) {
+    const weight = 2 ** (-Math.max(0, now - event.at) / PATH_SCORE_HALF_LIFE_MS);
+    totalWeight += weight;
+    if (event.ok) successWeight += weight;
+  }
   return {
     total: events.length,
     successes,
     failures,
     reliability: (successes + 1) / (events.length + 2),
+    weightedReliability: (successWeight + 1) / (totalWeight + 2),
   };
+}
+
+export function nodeProbeProxyUrl(name, candidates) {
+  const index = [...new Set(candidates)].sort().indexOf(name);
+  if (index < 0) throw new Error(`No isolated probe route for ${name}`);
+  return `http://127.0.0.1:${PROBE_BASE_PORT + index}`;
 }
 
 export function latestPathProbeWasSuccessful(
@@ -371,8 +450,20 @@ export function recordNodePathProbe(
   now = Date.now(),
   historyWindowMs = DEFAULT_PATH_HISTORY_WINDOW_MS,
 ) {
-  if (!name) return state;
+  if (!name || !isRealPathProbeResult(result)) return state;
   const previous = { ...newNodeState(), ...(state.nodes[name] || {}) };
+  const lastPath = previous.pathEvents.at(-1);
+  let penaltyRecoveryStartedAt = result.ok
+    ? (lastPath?.ok && now - lastPath.at <= PENALTY_RECOVERY_MAX_GAP_MS
+        ? previous.penaltyRecoveryStartedAt || now
+        : now)
+    : 0;
+  let ejectionCount = previous.ejectionCount;
+  if (result.ok && ejectionCount > 0
+    && now - penaltyRecoveryStartedAt >= PENALTY_RECOVERY_MS) {
+    ejectionCount -= 1;
+    penaltyRecoveryStartedAt = now;
+  }
   const pathEvents = [
     ...recentPathEvents(previous, now, historyWindowMs),
     {
@@ -386,10 +477,18 @@ export function recordNodePathProbe(
       ...state.nodes,
       [name]: {
         ...previous,
+        ejectionCount,
+        penaltyRecoveryStartedAt,
         pathEvents,
       },
     },
   };
+}
+
+export function isRealPathProbeResult(result) {
+  return Boolean(result)
+    && !result.infrastructureError
+    && result.status !== "provider_unhealthy";
 }
 
 export function ejectNode(
@@ -409,6 +508,7 @@ export function ejectNode(
       [name]: {
         ...previous,
         consecutiveSuccesses: 0,
+        penaltyRecoveryStartedAt: 0,
         ejectionCount,
         excludedUntil: Math.max(previous.excludedUntil, now + durationMs),
       },
@@ -469,7 +569,7 @@ export function currentPathInstabilityReason(state, now = Date.now(), options = 
   return null;
 }
 
-export function recoveryReason(state, now = Date.now(), options = {}) {
+function detectRecoveryReason(state, now, options) {
   const {
     failureThreshold = 3,
     minFailureAgeMs = 45_000,
@@ -489,8 +589,6 @@ export function recoveryReason(state, now = Date.now(), options = {}) {
     slowFailureThreshold = 4,
     slowFailureWindowMs = DEFAULT_ROLLING_WINDOW_MS,
   } = options;
-
-  if (now < state.nextRecoveryAt) return null;
 
   if (state.providerAlive === false && state.providerUnhealthyAt > 0) {
     return "provider_health_unavailable";
@@ -525,14 +623,6 @@ export function recoveryReason(state, now = Date.now(), options = {}) {
     return "selection_validation_failed";
   }
 
-  const instabilityReason = currentPathInstabilityReason(state, now, {
-    intermittentFailureThreshold,
-    intermittentFailureWindowMs,
-    slowFailureThreshold,
-    slowFailureWindowMs,
-  });
-  if (instabilityReason) return instabilityReason;
-
   if (
     state.currentFailures >= hardFailureThreshold
     && firstFailureAt
@@ -560,12 +650,42 @@ export function recoveryReason(state, now = Date.now(), options = {}) {
     return "active_current_probe_validation";
   }
 
+  const instabilityReason = currentPathInstabilityReason(state, now, {
+    intermittentFailureThreshold,
+    intermittentFailureWindowMs,
+    slowFailureThreshold,
+    slowFailureWindowMs,
+  });
+  if (instabilityReason) return instabilityReason;
+
   if (now < state.holdUntil) return null;
   if (activeTraffic) return null;
   if (state.currentFailures < failureThreshold) return null;
 
   if (!firstFailureAt || now - firstFailureAt < minFailureAgeMs) return null;
   return "current_probe_failures";
+}
+
+function isCriticalRecoveryReason(reason) {
+  return [
+    "provider_health_unavailable",
+    "passive_transport_errors",
+    "selection_validation_timeout",
+    "selection_validation_failed",
+    "hard_current_probe_failures",
+    "active_current_probe_failures",
+  ].includes(reason);
+}
+
+export function recoveryReason(state, now = Date.now(), options = {}) {
+  const reason = detectRecoveryReason(state, now, options);
+  if (now < state.nextRecoveryAt) {
+    const escalated = isCriticalRecoveryReason(reason)
+      && !isCriticalRecoveryReason(state.lastRecoveryReason)
+      && now - state.lastRecoveryAt >= 10_000;
+    if (!escalated) return null;
+  }
+  return reason;
 }
 
 function compareNodeHealth(
@@ -579,16 +699,7 @@ function compareNodeHealth(
   const rightStats = rollingNodeStats(right.node, now, rollingWindowMs);
   const leftPath = rollingPathStats(left.node, now, pathHistoryWindowMs);
   const rightPath = rollingPathStats(right.node, now, pathHistoryWindowMs);
-  const pathBucket = (stats) => {
-    if (stats.total < 3) return 1;
-    return stats.failures === 0 ? 2 : 0;
-  };
-  const leftPathBucket = pathBucket(leftPath);
-  const rightPathBucket = pathBucket(rightPath);
-  const bothPathKnown = leftPath.total >= 3 && rightPath.total >= 3;
-  return rightPathBucket - leftPathBucket
-    || (bothPathKnown ? rightPath.reliability - leftPath.reliability : 0)
-    || (bothPathKnown ? leftPath.failures - rightPath.failures : 0)
+  return rightPath.weightedReliability - leftPath.weightedReliability
     || left.node.ejectionCount - right.node.ejectionCount
     || rightStats.reliability - leftStats.reliability
     || Math.min(rightStats.total, 12) - Math.min(leftStats.total, 12)
@@ -716,6 +827,66 @@ export function pickEmergencyRecoveryBatch(
   return selected;
 }
 
+export function pickProviderRefreshBatch(
+  candidates,
+  proxies,
+  state,
+  now = Date.now(),
+  options = {},
+) {
+  const {
+    limit = 3,
+    minProbeAgeMs = 30_000,
+    rollingWindowMs = DEFAULT_ROLLING_WINDOW_MS,
+    pathHistoryWindowMs = DEFAULT_PATH_HISTORY_WINDOW_MS,
+  } = options;
+  const ranked = [...new Set(candidates)]
+    .filter((name) => (
+      name
+      && name !== state.current
+      && proxies?.[name]?.alive !== true
+    ))
+    .map((name) => ({
+      name,
+      node: { ...newNodeState(), ...(state.nodes[name] || {}) },
+    }))
+    .filter(({ node }) => (
+      !node.lastProbeAt || now - node.lastProbeAt >= minProbeAgeMs
+    ))
+    .sort((left, right) => (
+      Number(left.node.excludedUntil > now) - Number(right.node.excludedUntil > now)
+      || compareNodeHealth(
+        left,
+        right,
+        now,
+        rollingWindowMs,
+        pathHistoryWindowMs,
+      )
+      || left.node.lastProbeAt - right.node.lastProbeAt
+    ));
+
+  const buckets = new Map();
+  for (const candidate of ranked) {
+    const key = candidateBucket(candidate.name);
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(candidate.name);
+  }
+
+  const selected = [];
+  while (selected.length < limit) {
+    let added = false;
+    for (const names of buckets.values()) {
+      const name = names.shift();
+      if (!name) continue;
+      selected.push(name);
+      added = true;
+      if (selected.length === limit) break;
+    }
+    if (!added) break;
+  }
+  return selected;
+}
+
 export function pickRadarBatch(candidates, state, now = Date.now(), options = {}) {
   const {
     coldLimit = 4,
@@ -764,10 +935,10 @@ function recentSuccessfulSeries(node, now, options = {}) {
     historyWindowMs = 3 * 60_000,
     minSpanMs = 45_000,
   } = options;
-  const samples = [...(node.probeEvents || [])]
+  const history = [...(node.probeEvents || [])]
     .filter((event) => now - event.at <= historyWindowMs)
-    .sort((left, right) => left.at - right.at)
-    .slice(-requiredPasses);
+    .sort((left, right) => left.at - right.at);
+  const samples = history.slice(history.findLastIndex((event) => !event.ok) + 1);
   if (samples.length < requiredPasses) return false;
   if (!samples.every((sample) => sample.ok)) return false;
   const oldest = samples[0];
@@ -880,6 +1051,38 @@ export function recoveryBackoffDelay(
     scheduleMs.length - 1,
   );
   return scheduleMs[index];
+}
+
+export function recoveryBackoffDelayForReason(
+  priorExhaustions,
+  reason,
+  options = {},
+) {
+  const {
+    defaultScheduleMs = [10_000, 30_000, 60_000, 5 * 60_000],
+    providerUnavailableScheduleMs = [10_000, 30_000, 30_000],
+    activeTraffic = false,
+  } = options;
+  const delay = recoveryBackoffDelay(
+    priorExhaustions,
+    reason === "provider_health_unavailable"
+      ? providerUnavailableScheduleMs
+      : defaultScheduleMs,
+  );
+  return isCriticalRecoveryReason(reason) || activeTraffic
+    ? Math.min(delay, 60_000)
+    : delay;
+}
+
+export function shouldWakeRecoveryForStandby(
+  state,
+  readyCandidates,
+  now = Date.now(),
+) {
+  return Array.isArray(readyCandidates)
+    && readyCandidates.length > 0
+    && state.nextRecoveryAt > now
+    && (state.providerAlive === false || state.currentFailures > 0);
 }
 
 export function isGroupConnection(connection, groupName, nodeName = null) {

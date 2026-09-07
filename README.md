@@ -21,19 +21,22 @@
 | 环节 | 默认规则 |
 |---|---|
 | 当前路径 | 每 20 秒检查 Codex 入口，并完整读取 ChatGPT Usage 响应体；活跃会话降低到每 30 秒一次 |
-| Mihomo `alive:false` | 若 60 秒内完整路径刚成功，先做真实链路确认；确认失败才剔除，避免单次误报 |
+| Mihomo `alive:false` | 若 60 秒内完整路径刚成功，先做真实链路确认；否则只作为 provider 故障，不写入真实路径失败历史 |
 | 空闲连续失败 | 3 次失败且首个失败已持续 45 秒才恢复 |
 | 活跃会话失败 | 2 次失败后追加确认；仍失败则恢复，3 次失败可突破保持期 |
 | 被动传输错误 | 60 秒内出现 2 条不同 OpenAI 连接错误，立即恢复 |
 | 间歇故障 | 当前选中任期内，5 分钟累计 3 次或 10 分钟累计 4 次完整路径失败，触发恢复 |
 | 手动／首次选择 | 连续 2 次完整路径成功后才建立保持；2 次失败或 30 秒未完成则自动接管 |
-| 热备 | 持续维护 2 个热备；只有最近完整路径历史干净的节点才能快速接管 |
-| 普通候选 | 先做 3 次分离资格探针，切换后再做 4 次完整路径复核 |
+| 热备 | 持续对 2 个候选做独立完整路径探测；最近 10 分钟无失败、至少 4 次成功且跨度 45 秒，最后成功不超过 2 分钟，才允许快速接管 |
+| 后台重测 | 启动即扫描，之后每 60 秒重查冷候选；近期有流量时每轮 1 个，空闲时 2 个，不再因持续使用而无限暂停 |
+| 普通候选 | 先做 3 次分离的短探针＋独立完整路径验证；切换前再做一次独立即时复核，切换后做 4 次完整路径复核 |
 | 切换失败 | 回滚至恢复前节点，不把失败候选留在选择器上 |
-| 节点隔离 | 15、30、60 分钟递增；同一冷却期不会被重复延长 |
+| 节点隔离 | 15、30、60 分钟递增；同一冷却期不会被重复延长；连续 30 分钟完整路径成功后降一级，探针间隔不得超过 2 分钟，不提前解除既有隔离 |
 | 冷却池脱困 | 硬故障且普通候选耗尽时，最多取 3 个仍被 Mihomo 标记可达的冷却节点，重新完成严格 3＋4 验证；不是直接复活 |
-| 恢复退避 | 全部候选失败后按 10、30、60、300 秒退避重试 |
-| 旧连接 | 切换时记录旧出口连接并自然排水；旧连接后续错误不归罪于新节点 |
+| provider 缓存脱困 | 可达候选少于 3 个时，每轮最多主动刷新 3 个 `alive:false` 候选；刷新后仍须进入正常资格验证，绝不直接选中 |
+| 恢复退避 | 空闲间歇故障按 10、30、60、300 秒退避；严重故障或活跃流量最多 60 秒，provider 不可用最多 30 秒；新硬故障可打断旧轻故障退避，但两次恢复至少间隔 10 秒 |
+| macOS 切网保护 | 默认网卡或网关变化后进入 20 秒保护期；先复核原节点，切网抖动不计入节点故障，保护期内暂停候选雷达 |
+| 旧连接 | 切换后让仍走旧出口的 OpenAI 连接自然排空；排空期间错误不归罪于新节点，不主动删除正在输出的连接 |
 
 完整状态机见 [架构与熔断设计](docs/ARCHITECTURE.md)，环境变量见 [配置参考](docs/CONFIGURATION.md)。
 
@@ -48,6 +51,8 @@
 
 因此 `Script.openai.js` 创建的是普通 `select` 组。Mihomo 继续提供节点健康信号，但只有本控制器会自动修改该组的当前节点。
 
+脚本还从 `127.0.0.1:17900` 起，为去重排序后的每个候选创建直接绑定节点的 mixed 监听入口。控制器通过这些入口读取候选的完整响应体，验证通过后才修改正式 Selector。监听入口不主动产生流量，日常维护 2 个热备，并分批重测冷候选。候选排序使用半衰期 30 分钟的加权成功率，避免一次历史失败把稳定节点排到未知节点之后。
+
 ## 最省事：直接交给 Codex 配置
 
 将下面整段发给目标电脑上的 Codex。它会先只读确认环境，条件匹配时再安装；不会覆盖其他应用规则。
@@ -60,10 +65,10 @@
 严格按此顺序执行：
 1. 阅读仓库 README.md、AGENTS.md 和 docs/CODEX_SETUP.md。
 2. 只读确认操作系统、Node.js >= 22、curl、Clash Verge Rev／Mihomo、代理模式、HTTP 代理端口、Mihomo 控制通道、OpenAI 组名和候选数量。
-3. 如果现有全局扩展脚本还有其他规则，只合并 Script.openai.js 的 OpenAI 组与四条 OpenAI 域名规则，不要整文件覆盖。
+3. 如果现有全局扩展脚本还有其他规则，只合并 Script.openai.js 的 OpenAI 组、四条 OpenAI 域名规则和独立探测监听器，不要整文件覆盖；确认探测端口未占用。
 4. 确认 OpenAI 组最终为 Selector，候选不为空，并且只有本控制器负责自动切换。
-5. 运行 npm run verify，再使用临时状态文件执行 controller.mjs --once --shadow。影子验证必须找到组、看到 current_probe，且不改变当前选择。
-6. macOS 使用 Unix Socket 和 scripts/install-macos.sh；Windows 只使用绑定在 127.0.0.1 的 External Controller，并使用 scripts/install-windows.ps1。端口或路径不同时以实测值为准。
+5. 运行 npm run verify，再使用临时状态文件执行 controller.mjs --once --shadow。影子验证必须找到组、通过 current_probe 和独立热备完整路径探测，且不改变当前选择。
+6. macOS 使用 Unix Socket 和 scripts/install-macos.sh；若电脑会在有线和 Wi-Fi 间切换，可在确认系统代理端口后显式启用 MACOS_SYSTEM_PROXY_SYNC，并列出需要维护的网络服务。Windows 只使用绑定在 127.0.0.1 的 External Controller，并使用 scripts/install-windows.ps1。端口或路径不同时以实测值为准。
 7. 安装后观察至少 10 分钟，检查服务状态、current_probe、hot_standby_radar、recovery_complete、recovery_exhausted 和错误日志。
 8. 给我汇报：备份位置、安装位置、组类型、候选数、影子验证结果、服务状态、10 分钟观察结果和可执行的回滚命令。
 
@@ -90,6 +95,7 @@ macOS 默认使用 `/tmp/verge/verge-mihomo.sock`。Windows 使用显式开启�
 
 - `OpenAI 自动选择` 显示为 `Selector`；
 - 候选数量大于零；
+- 从 `127.0.0.1:17900` 起的独立探测端口与排序后的候选一一对应；
 - 软件处于规则模式；
 - OpenAI 域名规则位于兜底规则之前。
 
@@ -112,7 +118,18 @@ OPENAI_GROUP="OpenAI 自动选择" \
 sh scripts/install-macos.sh
 ```
 
-安装器会先运行 46 项测试（包含本机 HTTP API 集成测试）和影子验证，然后备份旧文件、安装用户级 LaunchAgent 并启动服务。
+如果同一台 Mac 会在有线网络和 Wi-Fi 间切换，并希望控制器自动补齐 Wi-Fi 的系统代理：
+
+```bash
+MIHOMO_PROXY="http://127.0.0.1:7897" \
+MACOS_SYSTEM_PROXY_SYNC=1 \
+MACOS_PROXY_SERVICES="Wi-Fi" \
+sh scripts/install-macos.sh
+```
+
+这是显式开启项。开启后，控制器每 30 秒检查这些网络服务，并在默认网卡变化时立即检查；HTTP、HTTPS 或 SOCKS 代理被关闭或偏离 `MIHOMO_PROXY` 时会自动修复。它不修改 DNS、网关、代理绕过列表或其他网络服务。
+
+安装器会先运行测试（包含本机 HTTP API 集成测试）和影子验证，然后备份旧文件、安装用户级 LaunchAgent 并启动服务。
 
 ### 3．Windows 10／11
 
@@ -151,11 +168,19 @@ rm -rf "$SHADOW_DIR"
 控制器输出 JSON Lines。优先关注：
 
 - `current_probe`：当前完整路径结果；
+- `candidate_preflight`：切换前的独立完整路径即时复核；
+- `candidate_probe_unavailable`：本机探测入口或映射有问题，该结果不处罚候选；
+- `hot_standby_radar.fastReady`：具备新鲜完整路径证据的快速热备；
 - `provider_health_false_overridden`：Mihomo 单次判死被完整路径复核覆盖；
+- `provider_cache_refresh_started`／`provider_cache_refresh_complete`：低存活池正在自动刷新少量 provider 健康缓存；
+- `recovery_woken_by_hot_standby`：热备已恢复，控制器提前结束退避；
 - `current_node_ejected`：当前节点进入隔离；
 - `recovery_candidate_rejected`：候选切换后复核失败并回滚；
 - `emergency_cooling_reuse`：普通候选耗尽，开始严格复核冷却节点；
 - `recovery_complete`：完整恢复完成；
+- `network_path_changed`／`network_transition_recovered`：默认网卡变化及原节点在新链路上的复核结果；
+- `system_proxy_repaired`：显式开启同步后，某个 macOS 网络服务的系统代理已被补齐；
+- `stale_connections_draining`：旧出口连接正在自然排空，不会被控制器主动删除；
 - `recovery_exhausted`：本轮没有候选通过，已进入退避。
 
 日志判读与常见故障见 [故障排查](docs/TROUBLESHOOTING.md)。
@@ -166,6 +191,14 @@ macOS：
 
 ```bash
 sh scripts/uninstall-macos.sh
+```
+
+若安装时启用了系统代理同步，先停止服务再按需关闭对应网络服务的代理。例如恢复 `Wi-Fi` 为关闭状态：
+
+```bash
+networksetup -setwebproxystate "Wi-Fi" off
+networksetup -setsecurewebproxystate "Wi-Fi" off
+networksetup -setsocksfirewallproxystate "Wi-Fi" off
 ```
 
 Windows：
@@ -191,7 +224,7 @@ PowerShell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\uninstall-wind
 npm run verify
 ```
 
-当前基线为 46 项状态机、脚本与本机 API 集成测试。贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [SECURITY.md](SECURITY.md)。
+测试覆盖状态机、脚本与本机 API 集成，包括错误响应体不得进入正式 Selector、先独立验证再切换、故障升级打断退避、完整路径热备与处罚恢复。贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [SECURITY.md](SECURITY.md)。
 
 ## License
 

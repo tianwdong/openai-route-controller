@@ -19,13 +19,19 @@ import {
   hasRecentTraffic,
   isGroupConnection,
   isOpenAIPathError,
+  isRealPathProbeResult,
   latestPathProbeWasSuccessful,
   newWatchdogState,
+  nodeProbeProxyUrl,
   nodeRegion,
   normalizeState,
+  networkPathChanged,
+  parseDefaultNetworkPath,
+  parseNetworkSetupProxy,
   passiveErrorKey,
   pickEmergencyRecoveryBatch,
   pickHotStandbyProbeBatch,
+  pickProviderRefreshBatch,
   pickRadarBatch,
   pickRecoveryBatch,
   planConnectionDrain,
@@ -37,14 +43,21 @@ import {
   recordNodeProbe,
   recordProviderHealth,
   recordSelectionValidation,
-  recoveryBackoffDelay,
+  recoveryBackoffDelayForReason,
   recoveryReason,
+  resetStateForNetworkTransition,
   restoreRecoveryOrigin,
+  shouldWakeRecoveryForStandby,
+  systemProxyNeedsRepair,
 } from "./lib.mjs";
 
 const args = new Set(process.argv.slice(2));
 const shadowMode = args.has("--shadow") || args.has("--dry-run") || args.has("--once");
 const onceMode = args.has("--once");
+
+function envEnabled(name) {
+  return /^(1|true|yes|on)$/i.test(process.env[name] || "");
+}
 
 const defaultStatePath = process.platform === "win32"
   ? path.join(
@@ -71,6 +84,21 @@ const config = {
   proxyUrl: process.env.MIHOMO_PROXY || "http://127.0.0.1:7897",
   curlPath: process.env.CURL_PATH
     || (process.platform === "win32" ? "curl.exe" : "curl"),
+  macosSystemProxySync: process.platform === "darwin"
+    && envEnabled("MACOS_SYSTEM_PROXY_SYNC"),
+  macosProxyServices: (process.env.MACOS_PROXY_SERVICES || "Wi-Fi")
+    .split(",")
+    .map((service) => service.trim())
+    .filter(Boolean),
+  networkSetupPath: process.env.NETWORKSETUP_PATH || "/usr/sbin/networksetup",
+  routePath: process.env.ROUTE_PATH || "/sbin/route",
+  systemProxyCheckIntervalMs: 30_000,
+  networkEnvironmentIntervalMs: 5_000,
+  networkTransitionGraceMs: Math.max(
+    5_000,
+    Number(process.env.NETWORK_TRANSITION_GRACE_MS) || 20_000,
+  ),
+  networkTransitionProbeIntervalMs: 3_000,
   currentIntervalMs: 20_000,
   activeCurrentIntervalMs: 30_000,
   selectionValidationIntervalMs: 5_000,
@@ -103,12 +131,16 @@ const config = {
   nodeTestTimeoutMs: 3_000,
   qualificationBatchSize: 3,
   emergencyBatchSize: 3,
+  providerRefreshAliveFloor: 3,
+  providerRefreshBatchSize: 3,
+  providerRefreshMinProbeAgeMs: 30_000,
   qualificationPasses: 3,
   qualificationSpacingMs: 800,
   qualificationWindowMs: 90_000,
   postSwitchProbeCount: 4,
   postSwitchSpacingMs: 1_500,
   radarColdBatchSize: 2,
+  activeRadarColdBatchSize: 1,
   hotStandbyCount: 2,
   hotStandbyRequiredPasses: 3,
   hotStandbyProbeTtlMs: 45_000,
@@ -123,6 +155,7 @@ const config = {
   pathHistoryWindowMs: 6 * 60 * 60_000,
   ejectionDurationsMs: [15 * 60_000, 30 * 60_000, 60 * 60_000],
   recoveryBackoffMs: [10_000, 30_000, 60_000, 5 * 60_000],
+  providerUnavailableBackoffMs: [10_000, 30_000, 30_000],
   endpoint: {
     url: "https://chatgpt.com/backend-api/codex/responses",
     expected: "405",
@@ -147,6 +180,12 @@ let logRequest = null;
 let openAIConnectionBytes = new Map();
 let drainingConnectionRoutes = new Map();
 let hotStandbyProbeRound = 0;
+let recoveryStartedWithActiveTraffic = false;
+let networkPathInitialized = false;
+let currentNetworkPath = null;
+let networkTransitionUntil = 0;
+let lastNetworkEnvironmentCheckAt = 0;
+let lastSystemProxyCheckAt = 0;
 
 function log(level, event, fields = {}) {
   process.stdout.write(`${JSON.stringify({
@@ -159,6 +198,189 @@ function log(level, event, fields = {}) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function runLocalCommand(command, commandArgs, timeoutMs = 5_000) {
+  return new Promise((resolve) => {
+    const child = spawn(command, commandArgs, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, LC_ALL: "C" },
+    });
+    let stdout = "";
+    let stderr = "";
+    let finished = false;
+    const finish = (result) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish({ ok: false, stdout, stderr, error: `Timed out after ${timeoutMs}ms` });
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", (error) => finish({ ok: false, stdout, stderr, error: error.message }));
+    child.on("close", (code) => finish({
+      ok: code === 0,
+      code,
+      stdout,
+      stderr,
+      error: code === 0 ? "" : stderr.trim() || `Exited with status ${code}`,
+    }));
+  });
+}
+
+function networkTransitionActive(now = Date.now()) {
+  return now < networkTransitionUntil;
+}
+
+function desiredSystemProxy() {
+  const target = new URL(config.proxyUrl);
+  if (target.protocol !== "http:" || target.username || target.password) {
+    throw new Error("macOS system proxy sync requires an unauthenticated http:// proxy URL");
+  }
+  const port = Number(target.port || 80);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`Invalid proxy port in ${config.proxyUrl}`);
+  }
+  return { server: target.hostname, port };
+}
+
+const macosProxyKinds = [
+  { name: "http", get: "-getwebproxy", set: "-setwebproxy" },
+  { name: "https", get: "-getsecurewebproxy", set: "-setsecurewebproxy" },
+  { name: "socks", get: "-getsocksfirewallproxy", set: "-setsocksfirewallproxy" },
+];
+
+async function ensureMacosSystemProxy({ force = false } = {}) {
+  if (!config.macosSystemProxySync) return { checked: 0, repaired: 0 };
+  const now = Date.now();
+  if (!force && now - lastSystemProxyCheckAt < config.systemProxyCheckIntervalMs) {
+    return { checked: 0, repaired: 0 };
+  }
+  lastSystemProxyCheckAt = now;
+
+  let desired;
+  try {
+    desired = desiredSystemProxy();
+  } catch (error) {
+    log("error", "system_proxy_config_invalid", { error: error.message });
+    return { checked: 0, repaired: 0 };
+  }
+
+  let checked = 0;
+  let repaired = 0;
+  for (const service of config.macosProxyServices) {
+    const needed = [];
+    for (const kind of macosProxyKinds) {
+      const result = await runLocalCommand(
+        config.networkSetupPath,
+        [kind.get, service],
+      );
+      if (!result.ok) {
+        log("warning", "system_proxy_check_failed", {
+          service,
+          kind: kind.name,
+          error: result.error,
+        });
+        continue;
+      }
+      checked += 1;
+      if (systemProxyNeedsRepair(parseNetworkSetupProxy(result.stdout), desired)) {
+        needed.push(kind);
+      }
+    }
+    if (needed.length === 0) continue;
+    if (shadowMode) {
+      log("warning", "shadow_system_proxy_repair_needed", {
+        service,
+        kinds: needed.map((kind) => kind.name),
+        server: desired.server,
+        port: desired.port,
+      });
+      continue;
+    }
+
+    const repairedKinds = [];
+    for (const kind of needed) {
+      const result = await runLocalCommand(
+        config.networkSetupPath,
+        [kind.set, service, desired.server, String(desired.port)],
+      );
+      if (!result.ok) {
+        log("warning", "system_proxy_repair_failed", {
+          service,
+          kind: kind.name,
+          error: result.error,
+        });
+        continue;
+      }
+      const verification = await runLocalCommand(
+        config.networkSetupPath,
+        [kind.get, service],
+      );
+      const verified = verification.ok
+        && !systemProxyNeedsRepair(
+          parseNetworkSetupProxy(verification.stdout),
+          desired,
+        );
+      if (verified) {
+        repaired += 1;
+        repairedKinds.push(kind.name);
+      } else {
+        log("warning", "system_proxy_repair_failed", {
+          service,
+          kind: kind.name,
+          error: verification.error || "verification mismatch",
+        });
+      }
+    }
+    if (repairedKinds.length > 0) {
+      log("warning", "system_proxy_repaired", {
+        service,
+        kinds: repairedKinds,
+        server: desired.server,
+        port: desired.port,
+      });
+    }
+  }
+  return { checked, repaired };
+}
+
+async function refreshNetworkEnvironment({ force = false } = {}) {
+  if (process.platform !== "darwin") return false;
+  const now = Date.now();
+  if (!force
+    && now - lastNetworkEnvironmentCheckAt < config.networkEnvironmentIntervalMs) {
+    return false;
+  }
+  lastNetworkEnvironmentCheckAt = now;
+
+  const route = await runLocalCommand(config.routePath, ["-n", "get", "default"]);
+  const nextPath = route.ok ? parseDefaultNetworkPath(route.stdout) : null;
+  let changed = false;
+  if (!networkPathInitialized) {
+    networkPathInitialized = true;
+    currentNetworkPath = nextPath;
+    log("info", "network_path_observed", { path: nextPath });
+  } else if (networkPathChanged(currentNetworkPath, nextPath)) {
+    const previousPath = currentNetworkPath;
+    currentNetworkPath = nextPath;
+    changed = true;
+    networkTransitionUntil = now + config.networkTransitionGraceMs;
+    state = resetStateForNetworkTransition(state, now);
+    urgentRecovery = true;
+    log("warning", "network_path_changed", {
+      from: previousPath,
+      to: nextPath,
+      graceUntil: networkTransitionUntil,
+    });
+  }
+
+  await ensureMacosSystemProxy({ force: force || changed });
+  return changed;
 }
 
 async function loadState() {
@@ -319,6 +541,7 @@ async function refreshGroup(source = "mihomo") {
 }
 
 function currentProbeDelay() {
+  if (networkTransitionActive()) return config.networkTransitionProbeIntervalMs;
   if (state.selectionValidation) return config.selectionValidationIntervalMs;
   return hasRecentTraffic(state, Date.now(), config.activeRadarQuietMs)
     ? config.activeCurrentIntervalMs
@@ -333,7 +556,7 @@ async function readProxyAlive(name) {
   return typeof proxy?.alive === "boolean" ? proxy.alive : null;
 }
 
-function curlProbe(endpoint) {
+function curlProbe(endpoint, proxyUrl = config.proxyUrl) {
   return new Promise((resolve) => {
     const child = spawn(config.curlPath, [
       "--silent",
@@ -345,7 +568,9 @@ function curlProbe(endpoint) {
       "--max-time",
       String(config.curlTimeoutSeconds),
       "--proxy",
-      config.proxyUrl,
+      proxyUrl,
+      "--noproxy",
+      "",
       "--output",
       os.devNull,
       "--write-out",
@@ -380,26 +605,92 @@ function curlProbe(endpoint) {
         bytes,
         totalMs: Number.isFinite(totalMs) ? totalMs : null,
         error: stderr.trim().slice(0, 300),
+        infrastructureError: code === 7,
       });
     });
   });
 }
 
-async function curlOpenAIPathProbe() {
-  const entry = await curlProbe(config.endpoint);
+async function curlOpenAIPathProbe(proxyUrl = config.proxyUrl) {
+  const entry = await curlProbe(config.endpoint, proxyUrl);
   if (!entry.ok) return entry;
-  const body = await curlProbe(config.bodyEndpoint);
+  const body = await curlProbe(config.bodyEndpoint, proxyUrl);
   return {
     ok: body.ok,
     status: `${entry.status}/${body.status}`,
     bytes: entry.bytes + body.bytes,
     totalMs: (entry.totalMs ?? 0) + (body.totalMs ?? 0),
     error: body.error,
+    infrastructureError: body.infrastructureError,
   };
+}
+
+async function probeNodePath(name) {
+  const requestPath = `/proxies/${encodeURIComponent(config.groupName)}`;
+  const before = await mihomoRequest("GET", requestPath);
+  const candidates = [...new Set(before.all || [])].sort();
+  const proxyUrl = nodeProbeProxyUrl(name, candidates);
+  const result = await curlOpenAIPathProbe(proxyUrl);
+  const after = await mihomoRequest("GET", requestPath);
+  const currentCandidates = [...new Set(after.all || [])].sort();
+  if (JSON.stringify(candidates) !== JSON.stringify(currentCandidates)) {
+    return {
+      name,
+      ok: false,
+      status: "probe_route_changed",
+      infrastructureError: true,
+      error: "Candidate routes changed during the isolated probe",
+      testedAt: Date.now(),
+    };
+  }
+  return {
+    ...result,
+    name,
+    delay: result.totalMs,
+    testedAt: Date.now(),
+    pathProbe: true,
+  };
+}
+
+function recordCandidateProbe(result) {
+  if (result.infrastructureError) {
+    log("warning", "candidate_probe_unavailable", {
+      node: result.name,
+      error: result.error,
+    });
+    return;
+  }
+  state = recordNodeProbe(
+    state, result.name, result, result.testedAt, config.rollingWindowMs,
+  );
+  if (result.pathProbe) {
+    state = recordNodePathProbe(
+      state, result.name, result, result.testedAt, config.pathHistoryWindowMs,
+    );
+  }
+}
+
+async function preflightCandidate(name, reason) {
+  const result = await probeNodePath(name);
+  recordCandidateProbe(result);
+  if (!result.ok && !result.infrastructureError) {
+    state = ejectNodeOnce(state, name, Date.now(), config.ejectionDurationsMs);
+  }
+  log(result.ok ? "info" : "warning", "candidate_preflight", {
+    node: name,
+    reason,
+    ok: result.ok,
+    status: result.status,
+    totalMs: result.totalMs,
+    infrastructureError: result.infrastructureError || undefined,
+    error: result.error || undefined,
+  });
+  return result.ok;
 }
 
 async function checkCurrent() {
   const node = state.current;
+  const transitionProbe = networkTransitionActive();
   let reportedProviderAlive = null;
   try {
     reportedProviderAlive = await readProxyAlive(node);
@@ -413,12 +704,12 @@ async function checkCurrent() {
   let result;
   if (
     reportedProviderAlive === false
-    && latestPathProbeWasSuccessful(
+    && (transitionProbe || latestPathProbeWasSuccessful(
       state,
       node,
       Date.now(),
       config.providerFalseConfirmationWindowMs,
-    )
+    ))
   ) {
     log("warning", "provider_health_confirmation_started", {
       node,
@@ -452,17 +743,39 @@ async function checkCurrent() {
   } else {
     result = await curlOpenAIPathProbe();
   }
-  state = recordProviderHealth(state, providerAlive);
   const now = Date.now();
+  if (!result.ok && networkTransitionActive(now)) {
+    log("warning", "network_transition_probe_suppressed", {
+      node,
+      status: result.status,
+      providerAlive,
+      reportedProviderAlive,
+      graceUntil: networkTransitionUntil,
+      error: result.error || undefined,
+    });
+    return false;
+  }
+  if (result.ok && networkTransitionActive(now)) {
+    networkTransitionUntil = 0;
+    log("info", "network_transition_recovered", {
+      node,
+      path: currentNetworkPath,
+      status: result.status,
+      totalMs: result.totalMs,
+    });
+  }
+  state = recordProviderHealth(state, providerAlive);
   const validation = state.selectionValidation;
   state = recordCurrentProbe(state, result, now);
-  state = recordNodePathProbe(
-    state,
-    node,
-    result,
-    now,
-    config.pathHistoryWindowMs,
-  );
+  if (isRealPathProbeResult(result)) {
+    state = recordNodePathProbe(
+      state,
+      node,
+      result,
+      now,
+      config.pathHistoryWindowMs,
+    );
+  }
   state = recordSelectionValidation(state, result, now, {
     holdMs: config.holdAfterSwitchMs,
   });
@@ -473,7 +786,9 @@ async function checkCurrent() {
     slowFailureWindowMs: config.slowFailureWindowMs,
   });
   if (result.ok) {
-    state.passiveErrors = [];
+    state.passiveErrors = state.passiveErrors.filter(
+      (event) => now - event.at <= config.passiveWindowMs,
+    );
     if (!instabilityReason) {
       state.nextRecoveryAt = 0;
       state.recoveryExhaustions = 0;
@@ -501,7 +816,7 @@ async function checkCurrent() {
   });
 
   if (validation && !state.selectionValidation && result.ok) {
-    let drain = { matched: 0 };
+    let drain = { matched: 0, protected: 0 };
     try {
       drain = await beginOpenAIConnectionDrain(node);
     } catch (error) {
@@ -516,12 +831,16 @@ async function checkCurrent() {
       to: node,
       holdUntil: state.holdUntil,
       drainingConnections: drain.matched,
+      protectedConnections: drain.protected,
     });
   }
   return result.ok;
 }
 
 async function probeNode(name, endpoint = config.endpoint) {
+  if (!endpoint?.url || !endpoint.expected) {
+    throw new Error("Invalid node probe endpoint");
+  }
   const query = new URLSearchParams({
     url: endpoint.url,
     timeout: String(config.nodeTestTimeoutMs),
@@ -553,6 +872,7 @@ async function probeNode(name, endpoint = config.endpoint) {
 }
 
 function currentRecoveryReason() {
+  if (networkTransitionActive()) return null;
   return recoveryReason(state, Date.now(), {
     failureThreshold: config.failureThreshold,
     minFailureAgeMs: config.minFailureAgeMs,
@@ -583,6 +903,11 @@ async function selectCandidate(name) {
   const { group } = await refreshGroup("controller");
   if (group.now !== name) {
     throw new Error(`Selector kept ${group.now} after requesting ${name}`);
+  }
+  try {
+    await beginOpenAIConnectionDrain(name);
+  } catch (error) {
+    log("warning", "connection_drain_failed", { current: name, error: error.message });
   }
 }
 
@@ -660,15 +985,10 @@ async function qualifyCandidates(names) {
     const samples = [];
     const endpoints = [config.endpoint, config.traceEndpoint, config.endpoint];
     for (let attempt = 0; attempt < config.qualificationPasses; attempt += 1) {
-      const result = await probeNode(name, endpoints[attempt % endpoints.length]);
+      const shortProbe = await probeNode(name, endpoints[attempt % endpoints.length]);
+      const result = shortProbe.ok ? await probeNodePath(name) : shortProbe;
       samples.push(result);
-      state = recordNodeProbe(
-        state,
-        result.name,
-        result,
-        result.testedAt,
-        config.rollingWindowMs,
-      );
+      recordCandidateProbe(result);
       if (!result.ok) break;
       if (attempt + 1 < config.qualificationPasses) {
         await sleep(config.qualificationSpacingMs);
@@ -728,13 +1048,15 @@ async function verifySelectedCandidate(name, probeCount = config.postSwitchProbe
       : await curlOpenAIPathProbe();
     const testedAt = Date.now();
     state = recordCurrentProbe(state, result, testedAt);
-    state = recordNodePathProbe(
-      state,
-      name,
-      result,
-      testedAt,
-      config.pathHistoryWindowMs,
-    );
+    if (isRealPathProbeResult(result)) {
+      state = recordNodePathProbe(
+        state,
+        name,
+        result,
+        testedAt,
+        config.pathHistoryWindowMs,
+      );
+    }
     log(result.ok ? "info" : "warning", "post_switch_probe", {
       node: name,
       attempt,
@@ -789,12 +1111,19 @@ async function rollbackRejectedCandidate(origin, candidate, reason) {
   }
 }
 
-function scheduleRecoveryRetry() {
-  const delayMs = recoveryBackoffDelay(
+function scheduleRecoveryRetry(reason) {
+  const delayMs = recoveryBackoffDelayForReason(
     state.recoveryExhaustions,
-    config.recoveryBackoffMs,
+    reason,
+    {
+      defaultScheduleMs: config.recoveryBackoffMs,
+      providerUnavailableScheduleMs: config.providerUnavailableBackoffMs,
+      activeTraffic: recoveryStartedWithActiveTraffic
+        || hasRecentTraffic(state, Date.now(), config.activeTrafficGraceMs),
+    },
   );
   state.recoveryExhaustions += 1;
+  state.lastRecoveryReason = reason;
   state.nextRecoveryAt = Date.now() + delayMs;
   return delayMs;
 }
@@ -830,7 +1159,7 @@ async function completeRecovery(
     state.holdUntil = verifiedAt + config.holdAfterSwitchMs;
     state.selectionValidation = null;
   }
-  let drain = { matched: 0 };
+  let drain = { matched: 0, protected: 0 };
   try {
     drain = await beginOpenAIConnectionDrain(candidate);
   } catch (error) {
@@ -851,6 +1180,7 @@ async function completeRecovery(
       : 0,
     holdUntil: state.holdUntil,
     drainingConnections: drain.matched,
+    protectedConnections: drain.protected,
   });
   return true;
 }
@@ -868,7 +1198,11 @@ async function recover(reason) {
     providerUnhealthyAt: state.providerUnhealthyAt,
   };
   const recoveryAt = Date.now();
+  recoveryStartedWithActiveTraffic = hasRecentTraffic(
+    state, recoveryAt, config.activeTrafficGraceMs,
+  );
   state.lastRecoveryAt = recoveryAt;
+  state.lastRecoveryReason = reason;
   state.nextRecoveryAt = 0;
   state.holdUntil = 0;
   state.passiveErrors = [];
@@ -889,15 +1223,60 @@ async function recover(reason) {
   });
 
   const { candidates } = await refreshGroup();
-  const proxySnapshot = await mihomoRequest("GET", "/proxies");
-  const providerAliveCandidates = filterProviderAliveCandidates(
+  let proxySnapshot = await mihomoRequest("GET", "/proxies");
+  let providerAliveCandidates = filterProviderAliveCandidates(
     candidates,
     proxySnapshot?.proxies,
   );
+  const providerAliveBeforeRefresh = providerAliveCandidates.length;
+  let refreshBatch = [];
+  let refreshedQualified = [];
+  if (providerAliveCandidates.length < config.providerRefreshAliveFloor) {
+    refreshBatch = pickProviderRefreshBatch(
+      candidates,
+      proxySnapshot?.proxies,
+      state,
+      Date.now(),
+      {
+        limit: config.providerRefreshBatchSize,
+        minProbeAgeMs: config.providerRefreshMinProbeAgeMs,
+        rollingWindowMs: config.rollingWindowMs,
+        pathHistoryWindowMs: config.pathHistoryWindowMs,
+      },
+    );
+    if (refreshBatch.length > 0) {
+      log("warning", "provider_cache_refresh_started", {
+        reason,
+        alive: providerAliveCandidates.length,
+        candidates: refreshBatch,
+      });
+      refreshedQualified = await qualifyCandidates(refreshBatch);
+      proxySnapshot = await mihomoRequest("GET", "/proxies");
+      providerAliveCandidates = filterProviderAliveCandidates(
+        candidates,
+        proxySnapshot?.proxies,
+      );
+      log(
+        providerAliveCandidates.length > providerAliveBeforeRefresh
+          ? "info"
+          : "warning",
+        "provider_cache_refresh_complete",
+        {
+          reason,
+          tested: refreshBatch,
+          qualified: refreshedQualified.map((candidate) => candidate.name),
+          aliveBefore: providerAliveBeforeRefresh,
+          aliveAfter: providerAliveCandidates.length,
+        },
+      );
+    }
+  }
   log("info", "provider_candidate_filter", {
     candidates: candidates.length,
     alive: providerAliveCandidates.length,
     rejected: candidates.length - providerAliveCandidates.length,
+    refreshAttempted: refreshBatch.length,
+    refreshQualified: refreshedQualified.length,
   });
   const tested = [];
   const radarReadyStandbys = rankHotStandbys(
@@ -934,6 +1313,7 @@ async function recover(reason) {
 
   for (const candidateName of hotStandbys) {
     tested.push(candidateName);
+    if (!await preflightCandidate(candidateName, reason)) continue;
     await selectCandidate(candidateName);
     let verification;
     try {
@@ -1016,6 +1396,7 @@ async function recover(reason) {
       });
 
       for (const candidate of ranked) {
+        if (!await preflightCandidate(candidate.name, reason)) continue;
         await selectCandidate(candidate.name);
         let verification;
         try {
@@ -1080,6 +1461,7 @@ async function recover(reason) {
       );
 
       for (const candidate of ranked) {
+        if (!await preflightCandidate(candidate.name, reason)) continue;
         await selectCandidate(candidate.name);
         let verification;
         try {
@@ -1115,7 +1497,7 @@ async function recover(reason) {
     }
   }
 
-  const retryInMs = scheduleRecoveryRetry();
+  const retryInMs = scheduleRecoveryRetry(reason);
   log("error", "recovery_exhausted", {
     reason,
     from: before,
@@ -1145,7 +1527,7 @@ async function maybeRecover() {
   try {
     return await recover(reason);
   } catch (error) {
-    const retryInMs = scheduleRecoveryRetry();
+    const retryInMs = scheduleRecoveryRetry(reason);
     log("error", "recovery_failed", {
       reason,
       current: state.current,
@@ -1158,15 +1540,16 @@ async function maybeRecover() {
 }
 
 async function runRadar(candidates) {
+  const activeTraffic = hasRecentTraffic(state, Date.now(), config.activeRadarQuietMs);
   const batch = pickRadarBatch(candidates, state, Date.now(), {
-    coldLimit: config.radarColdBatchSize,
+    coldLimit: activeTraffic ? config.activeRadarColdBatchSize : config.radarColdBatchSize,
     hotLimit: 0,
     rollingWindowMs: config.rollingWindowMs,
     pathHistoryWindowMs: config.pathHistoryWindowMs,
   });
   if (batch.length === 0) return;
 
-  const results = await Promise.all(batch.map(probeNode));
+  const results = await Promise.all(batch.map((name) => probeNode(name)));
   for (const result of results) {
     state = recordNodeProbe(
       state,
@@ -1177,6 +1560,7 @@ async function runRadar(candidates) {
     );
   }
   log("info", "radar_batch", {
+    activeTraffic,
     tested: batch,
     successful: results.filter((result) => result.ok).map((result) => result.name),
   });
@@ -1208,15 +1592,12 @@ async function runHotStandbyRadar(candidates) {
   const endpoints = [config.endpoint, config.traceEndpoint, config.endpoint];
   const endpoint = endpoints[hotStandbyProbeRound % endpoints.length];
   hotStandbyProbeRound += 1;
-  const results = await Promise.all(batch.map((name) => probeNode(name, endpoint)));
+  const results = await Promise.all(batch.map(async (name) => {
+    const shortProbe = await probeNode(name, endpoint);
+    return shortProbe.ok ? probeNodePath(name) : shortProbe;
+  }));
   for (const result of results) {
-    state = recordNodeProbe(
-      state,
-      result.name,
-      result,
-      result.testedAt,
-      config.rollingWindowMs,
-    );
+    recordCandidateProbe(result);
   }
   const ready = rankHotStandbys(
     providerAliveCandidates,
@@ -1248,9 +1629,27 @@ async function runHotStandbyRadar(candidates) {
     target: config.hotStandbyCount,
     endpoint: endpoint.url,
   });
+  const wakeAt = Date.now();
+  if (shouldWakeRecoveryForStandby(state, ready, wakeAt)) {
+    const previousRecoveryAt = state.nextRecoveryAt;
+    state.nextRecoveryAt = wakeAt;
+    urgentRecovery = true;
+    log("warning", "recovery_woken_by_hot_standby", {
+      ready,
+      previousRecoveryAt,
+      wakeAt,
+    });
+  }
 }
 
 function notePassiveError(sourceMessage) {
+  if (networkTransitionActive()) {
+    log("info", "network_transition_passive_error_suppressed", {
+      sourceMessage,
+      graceUntil: networkTransitionUntil,
+    });
+    return;
+  }
   const routeKey = passiveErrorKey(sourceMessage);
   const drainingConnection = drainingConnectionRoutes.get(routeKey);
   if (drainingConnection) {
@@ -1323,6 +1722,7 @@ function startLogMonitor() {
 async function run() {
   await loadState();
   const { group, candidates } = await refreshGroup();
+  await refreshNetworkEnvironment({ force: true });
   log("info", "controller_started", {
     mode: shadowMode ? "shadow" : "live",
     group: config.groupName,
@@ -1330,23 +1730,34 @@ async function run() {
     current: group.now,
     candidates: candidates.length,
     endpoint: config.endpoint.url,
+    macosSystemProxySync: config.macosSystemProxySync,
+    macosProxyServices: config.macosSystemProxySync
+      ? config.macosProxyServices
+      : [],
   });
 
   await observeOpenAIActivity();
   await checkCurrent();
   await maybeRecover();
   urgentRecovery = false;
+  if (onceMode) {
+    await runRadar(candidates);
+    await runHotStandbyRadar(candidates);
+  }
   await saveState();
   if (onceMode) return;
 
   startLogMonitor();
   let nextCurrentProbeAt = Date.now() + currentProbeDelay();
   let nextActivityAt = Date.now() + config.activityIntervalMs;
-  let nextRadarAt = Date.now() + config.radarIntervalMs;
+  let nextRadarAt = Date.now();
   let nextHotStandbyAt = Date.now();
 
   while (!stopped) {
     try {
+      await refreshNetworkEnvironment({
+        force: urgentRecovery || currentRecoveryReason() !== null,
+      });
       const { candidates: latestCandidates } = await refreshGroup();
       const now = Date.now();
       if (now >= nextActivityAt) {
@@ -1382,19 +1793,17 @@ async function run() {
         nextCurrentProbeAt = Date.now() + currentProbeDelay();
       }
 
-      if (!recovered && Date.now() >= nextHotStandbyAt) {
+      if (!recovered
+        && !networkTransitionActive()
+        && Date.now() >= nextHotStandbyAt) {
         await runHotStandbyRadar(latestCandidates);
         nextHotStandbyAt = Date.now() + config.hotStandbyIntervalMs;
       }
 
-      if (!recovered && Date.now() >= nextRadarAt) {
-        if (!hasRecentTraffic(state, Date.now(), config.activeRadarQuietMs)) {
-          await runRadar(latestCandidates);
-        } else {
-          log("info", "cold_radar_skipped_active_traffic", {
-            lastOpenAITrafficAt: state.lastOpenAITrafficAt,
-          });
-        }
+      if (!recovered
+        && !networkTransitionActive()
+        && Date.now() >= nextRadarAt) {
+        await runRadar(latestCandidates);
         nextRadarAt = Date.now() + config.radarIntervalMs;
       }
       await saveState();

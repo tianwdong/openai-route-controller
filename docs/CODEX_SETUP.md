@@ -68,6 +68,7 @@ Windows 不调用 Clash Verge Rev 内部命名管道。确认用户已经在 GUI
 4. OpenAI 规则位于原有兜底规则之前；
 5. 删除旧的同名 OpenAI 组，其他组保持原顺序和内容；
 6. 不引入第二个自动选择器。
+7. 按候选去重排序，从 `127.0.0.1:17900` 起逐个建立直接绑定节点的 mixed 探测监听器，保留其他 listener；确认端口未占用。
 
 保存并重新应用订阅后，确认组类型为 Selector、候选数大于零。候选为空时停止，报告节点命名与 `supportedRegion` 不匹配。
 
@@ -119,6 +120,7 @@ try {
 - `type` 为 `Selector`；
 - `candidates` 大于零；
 - 出现 `current_probe`；
+- `hot_standby_radar.successful` 包含通过独立完整路径探测的节点，且没有 `candidate_probe_unavailable`；
 - Selector 的当前节点没有变化。
 
 `current_probe.ok=false` 时先报告实际状态、状态码和错误类别，不进入安装阶段。
@@ -135,6 +137,16 @@ MIHOMO_PROXY="http://127.0.0.1:7897" \
 OPENAI_GROUP="OpenAI 自动选择" \
 sh scripts/install-macos.sh
 ```
+
+若用户明确要求支持有线与 Wi-Fi 热切换，先分别读取相关网络服务的 HTTP、HTTPS 和 SOCKS 代理状态。只有在代理端口已经确认、用户授权控制器持续维护系统代理时，才追加：
+
+```bash
+MACOS_SYSTEM_PROXY_SYNC=1 \
+MACOS_PROXY_SERVICES="Wi-Fi" \
+sh scripts/install-macos.sh
+```
+
+服务名必须来自 `networksetup -listallnetworkservices`，多个名称用逗号分隔。不要擅自把所有网络服务纳入维护，也不要修改 DNS、网关或代理绕过列表。
 
 安装器会在覆盖同名文件前建立时间戳备份。不得手工删除旧文件。
 
@@ -176,8 +188,11 @@ Get-Content (Join-Path $root "controller.error.log") -Tail 80
 - 服务没有重启循环；
 - `current_probe` 按预期间隔出现；
 - 热备探针没有持续拖垮当前连接；
+- 稳定采样后出现非空 `hot_standby_radar.fastReady`；仅 `ready` 非空不能证明完整路径热备已建立；
 - 当前节点没有被无证据反复切换；
-- 若发生恢复，候选先通过资格验证，并在 `recovery_complete` 前完成切换后复核；
+- macOS 切换默认网卡时出现 `network_path_changed`，过渡失败不处罚节点，原节点复核成功后出现 `network_transition_recovered`；
+- 显式开启系统代理同步时，列出的网络服务三类代理均指向 `MIHOMO_PROXY`；
+- 若发生恢复，候选先通过独立完整路径资格验证和 `candidate_preflight`，再修改正式 Selector，随后完成切换后复核；
 - 候选复核失败时出现回滚，Selector 不停留在坏候选；
 - 错误日志没有持续增长。
 

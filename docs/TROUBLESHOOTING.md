@@ -9,6 +9,8 @@
 - 字节数不足：响应体没有完整读取；
 - `providerAlive=false`：Mihomo 当前认为节点不可用，控制器会按是否有新鲜完整路径证据决定是否追加确认。
 
+未真正发出完整路径请求的 `provider_unhealthy` 不计入 `pathEvents`。它会立即触发 provider 恢复，但不会伪造间歇性路径失败。
+
 不要用手动测速结果替代完整路径日志。
 
 ## 控制器停在页面显示 Timeout 的节点
@@ -33,9 +35,25 @@
 - 候选池全部冷却，但故障理由还不足以启用严格冷却池复用；
 - Mihomo provider 状态长期未更新，手动测速刷新了其 `alive` 数据。
 
-查看 `provider_candidate_filter`、`recovery_exhausted`、`nextRecoveryAt` 和 `emergency_cooling_reuse` 的时间线，不要只看最后一行。
+新版在 provider-alive 候选少于 3 个时会自动执行同类刷新，但每轮最多只测 3 个，防止全池并发测速反过来拖垮代理。查看：
+
+- `provider_cache_refresh_started`：本轮主动刷新的候选；
+- `provider_cache_refresh_complete`：刷新前后的 alive 数量；
+- `provider_candidate_filter`：刷新后实际允许进入严格验证的候选；
+- `recovery_exhausted`：本轮全失败后的下次重试时间；
+- `recovery_woken_by_hot_standby`：热备恢复后是否提前结束退避。
+
+即使刷新探针成功，只要 Mihomo 仍未把节点标成 alive，控制器也不会直接切过去。
 
 ## Codex 一直重连，但控制器探针正常
+
+`Error running remote compact task` 后伴随 `stream disconnected before completion` 和 `error decoding response body`，表示远端压缩请求在读取响应体时失败；普通生成中的 `Reconnecting... 1/5` 也需要按实际请求断流排查。仅凭这段错误无法确定是代理、服务端还是客户端传输实现，不能把 Usage 页的完整响应当作修复验收。
+
+同一节点的短请求成功不会清除最近 60 秒内的业务连接错误。检查是否有两条不同连接的被动错误被识别；超过窗口的错误不会触发恢复。
+
+如果 `hot_standby_radar.ready` 非空但 `fastReady` 长期为空，检查独立完整路径探测是否运行、最近 10 分钟是否仍有真实失败，以及脚本的候选监听映射是否与当前组一致。`candidate_probe_unavailable` 表示本机探测入口缺失或映射变化，不能据此处罚上游节点。成功的 Mihomo HEAD 不能替代完整响应体；`candidate_preflight` 必须发生在正式切换之前。
+
+持续多次完整路径失败应优先进入 `hard_current_probe_failures` 或活跃故障，不能一直被间歇窗口理由覆盖。严重故障退避最多 60 秒，provider 故障最多 30 秒；空闲间歇故障才允许等待 300 秒。
 
 `405/200` 完整路径探针仍然不是已登录的真实长流。以下情况可能无法由控制器自动识别：
 
@@ -50,6 +68,30 @@
 带 Cloudflare 页面和 `cf-ray` 的 `403` 可能是会话、风控或出口身份问题。控制器只把 Usage 探针的完整 `403` 用作“响应体可读”的网络证据，不会把真实 Codex 请求的 `403` 视为业务成功。
 
 检查实际 Responses 请求是否持续从同一出口发出，以及切换前后公网 IP 是否变化。不要把账号 Cookie 或响应页面上传到 issue。
+
+## 拔掉有线后立刻返回 403
+
+如果错误与拔线动作严格同时发生，先检查 macOS 的各网络服务，而不是继续调节点阈值：
+
+```bash
+networksetup -getwebproxy "Wi-Fi"
+networksetup -getsecurewebproxy "Wi-Fi"
+networksetup -getsocksfirewallproxy "Wi-Fi"
+scutil --proxy
+```
+
+有线服务和 `Wi-Fi` 的代理状态彼此独立。典型失配是三项都保存了 `127.0.0.1:7897`，但 `Wi-Fi` 显示 `Enabled: No`；拔线后 Codex 直连 `chatgpt.com`，而控制器因 curl 显式传入代理仍显示 `current_probe ok=true`。
+
+确认端口无误后，可在安装控制器时显式开启自动维护：
+
+```bash
+MIHOMO_PROXY="http://127.0.0.1:7897" \
+MACOS_SYSTEM_PROXY_SYNC=1 \
+MACOS_PROXY_SERVICES="Wi-Fi" \
+sh scripts/install-macos.sh
+```
+
+观察 `network_path_changed`、`system_proxy_repaired`、`network_transition_probe_suppressed` 和 `network_transition_recovered`。若准备手动关闭系统代理，应先停止控制器，否则同步功能会在下一轮检查时重新开启它。
 
 ## macOS 服务未启动
 
