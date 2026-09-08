@@ -293,7 +293,7 @@ async function probeScenario(context, { currentAlive = true, candidateBodyBytes 
   };
 }
 
-test("shadow scanning uses valid delay URLs and builds full-path hot-standby evidence", unixCurlOnly, async (context) => {
+test("shadow cold scanning uses valid delay URLs while hot standby builds independent full-path evidence", unixCurlOnly, async (context) => {
   const scenario = await probeScenario(context, { warm: true });
   const result = await runController(scenario.env);
   assert.equal(result.code, 0, result.stderr || result.stdout);
@@ -302,19 +302,38 @@ test("shadow scanning uses valid delay URLs and builds full-path hot-standby evi
   assert.deepEqual(events.find((event) => event.event === "hot_standby_radar")?.fastReady, ["TW-CANDIDATE"]);
   const saved = JSON.parse(await readFile(scenario.statePath, "utf8"));
   assert.equal(saved.nodes["TW-CANDIDATE"].pathEvents.length, 4);
-  assert.equal(scenario.delays.length, 2);
+  assert.equal(scenario.delays.length, 1);
   assert.equal(scenario.selections.length, 0);
 });
 
-test("active live traffic still refreshes one stale unavailable candidate without switching", unixCurlOnly, async (context) => {
+test("active traffic cold scanning selects the stale unavailable candidate before hot probing", unixCurlOnly, async (context) => {
   const scenario = await probeScenario(context, { warm: true, activeTraffic: true, coldCandidate: true });
-  const result = await runController(scenario.env, "radar_batch");
+  const result = await runController(scenario.env);
   assert.equal(result.code, 0, result.stderr || result.stdout);
   const events = result.stdout.trim().split("\n").map(JSON.parse);
   const radar = events.find((event) => event.event === "radar_batch");
   assert.deepEqual(radar?.tested, ["US-COLD"]);
   assert.equal(radar?.activeTraffic, true);
   assert.deepEqual(radar?.successful, ["US-COLD"]);
+  assert.equal(scenario.selections.length, 0);
+  assert.equal(scenario.deletes, 0);
+});
+
+test("active live traffic permits one cold scan after concurrent hot probes without switching", unixCurlOnly, async (context) => {
+  const scenario = await probeScenario(context, { warm: true, activeTraffic: true, coldCandidate: true });
+  const result = await runController(scenario.env, "radar_batch");
+  assert.equal(result.code, 0, result.stderr || result.stdout);
+  const events = result.stdout.trim().split("\n").map(JSON.parse);
+  const hot = events.find((event) => event.event === "hot_standby_radar");
+  const radar = events.find((event) => event.event === "radar_batch");
+  assert.ok(hot?.tested.includes("US-COLD"));
+  assert.ok(events.indexOf(hot) < events.indexOf(radar));
+  assert.equal(radar?.activeTraffic, true);
+  assert.equal(radar?.tested.length, 1);
+  // Both candidates were refreshed concurrently; completion order determines
+  // which is oldest when the subsequent cold scan starts.
+  assert.ok(["TW-CANDIDATE", "US-COLD"].includes(radar.tested[0]));
+  assert.deepEqual(radar.successful, radar.tested);
   assert.equal(scenario.selections.length, 0);
   assert.equal(scenario.deletes, 0);
 });
@@ -482,4 +501,63 @@ test("slow system proxy checks do not block current-path monitoring", {skip:proc
   assert.ok(probes.length>=2);
   assert.ok(result.elapsedMs<25000,`monitor delayed ${result.elapsedMs}ms`);
   assert.equal(scenario.selections.length,0);
+});
+
+
+test("historical passive failures complete live recovery despite successful short probes", unixCurlOnly, async (context) => {
+  const scenario = await probeScenario(context);
+  const saved = JSON.parse(await readFile(scenario.statePath, "utf8"));
+  saved.passiveErrors = [{at:Date.now()-45000,key:"failure-a"},{at:Date.now()-5000,key:"failure-b"}];
+  await writeFile(scenario.statePath,JSON.stringify(saved));
+  scenario.env.ROUTE_PATH="/usr/bin/false";
+  const result = await runController(scenario.env,"recovery_complete");
+  assert.equal(result.code,0,result.stderr||result.stdout);
+  const events=result.stdout.trim().split("\n").map(JSON.parse);
+  assert.ok(events.some(e=>e.event==="current_node_ejected" && e.reason==="passive_transport_errors"));
+  assert.ok(events.some(e=>e.event==="qualification_round" && e.successful.includes("TW-CANDIDATE")));
+  assert.equal(scenario.selections.length,1,"qualified recovery must not vanish after its own passiveErrors reset");
+  assert.ok(events.some(e=>e.event==="recovery_complete"));
+});
+
+
+test("historical passive recovery backoff survives a successful short probe", unixCurlOnly, async (context) => {
+  const scenario=await probeScenario(context);
+  const saved=JSON.parse(await readFile(scenario.statePath,"utf8"));
+  const now=Date.now();
+  saved.passiveErrors=[{at:now-8000,key:"failure-a"},{at:now-5000,key:"failure-b"}];
+  saved.nextRecoveryAt=now+60000;saved.lastRecoveryAt=now-1000;
+  saved.lastRecoveryReason="passive_transport_errors";saved.recoveryExhaustions=3;
+  await writeFile(scenario.statePath,JSON.stringify(saved));
+  const result=await runController(scenario.env);
+  assert.equal(result.code,0,result.stderr||result.stdout);
+  const events=result.stdout.trim().split("\n").map(JSON.parse);
+  assert.equal(events.some(e=>e.event==="shadow_recovery"),false,"same passive fault must respect the scheduled retry after a short success");
+  const after=JSON.parse(await readFile(scenario.statePath,"utf8"));
+  assert.equal(after.nextRecoveryAt,saved.nextRecoveryAt);
+  assert.equal(after.recoveryExhaustions,3);
+});
+
+
+test("historical post-switch body failure rolls back and preserves failed origin", unixCurlOnly, async(context)=>{
+  const scenario=await probeScenario(context,{currentAlive:false});
+  scenario.env.ROUTE_PATH="/usr/bin/false";
+  const curl=await readFile(scenario.env.CURL_PATH,"utf8");
+  await writeFile(scenario.env.CURL_PATH,curl.replace("const isBody =",`
+    const selected=fs.readFileSync(process.env.FAKE_SELECTION_FILE,'utf8');
+    if(selected==='TW-CANDIDATE' && proxy.endsWith(':7897') && url.includes('/codex/settings/usage')) {
+      process.stdout.write('000\\t0\\t0.01');process.exit(28);
+    }
+    const isBody =`));
+  const result=await runController(scenario.env,"recovery_exhausted");
+  assert.equal(result.code,0,result.stderr||result.stdout);
+  const events=result.stdout.trim().split("\n").map(JSON.parse);
+  assert.deepEqual(scenario.selections.map(s=>s.name),['TW-CANDIDATE','JP-CURRENT']);
+  assert.ok(events.some(e=>e.event==='post_switch_probe' && !e.ok));
+  assert.ok(events.some(e=>e.event==='recovery_candidate_rolled_back'));
+  assert.equal(events.some(e=>e.event==='recovery_complete'),false);
+  assert.equal(scenario.deletes,0);
+  const saved=JSON.parse(await readFile(scenario.statePath,'utf8'));
+  assert.equal(saved.current,'JP-CURRENT');assert.ok(saved.currentFailures>0);
+  assert.ok(saved.nodes['TW-CANDIDATE'].excludedUntil>Date.now());
+  assert.ok(saved.nextRecoveryAt>Date.now());
 });

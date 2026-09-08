@@ -785,12 +785,15 @@ test("hot standbys require three fresh successes spread across time", () => {
   state.current = "JP-2";
   for (const at of [100_000, 160_000, 220_000]) {
     state = recordNodeProbe(state, "JP4-HY2", { ok: true, delay: 220 }, at);
+    state = recordNodePathProbe(state, "JP4-HY2", { ok: true }, at);
   }
   for (const at of [217_000, 218_000, 219_000]) {
     state = recordNodeProbe(state, "SG-1", { ok: true, delay: 80 }, at);
+    state = recordNodePathProbe(state, "SG-1", { ok: true }, at);
   }
   for (const [at, ok] of [[100_000, true], [160_000, false], [220_000, true]]) {
     state = recordNodeProbe(state, "TW-7", { ok, delay: 180 }, at);
+    state = recordNodePathProbe(state, "TW-7", { ok }, at);
   }
 
   assert.deepEqual(
@@ -811,12 +814,15 @@ test("hot standbys require three fresh successes spread across time", () => {
 test("extra successful radar samples do not erase a standby's established time span", () => {
   let state = newWatchdogState();
   state.current = "JP-CURRENT";
-  for (const at of [100_000, 120_000, 140_000, 140_001]) {
+  for (const at of [100_000, 120_000, 140_000]) {
     state = recordNodeProbe(state, "TW-1", { ok: true, delay: 20 }, at);
+    state = recordNodePathProbe(state, "TW-1", { ok: true }, at);
   }
+  state = recordNodeProbe(state, "TW-1", { ok: true, delay: 20 }, 140_001);
   const options = { requiredPasses: 3, historyWindowMs: 90_000, minSpanMs: 35_000 };
   assert.deepEqual(rankHotStandbys(["TW-1"], state, 140_001, options), ["TW-1"]);
   state = recordNodeProbe(state, "TW-1", { ok: false }, 145_000);
+  state = recordNodePathProbe(state, "TW-1", { ok: false }, 145_000);
   for (const at of [150_000, 150_001, 150_002]) {
     state = recordNodeProbe(state, "TW-1", { ok: true, delay: 20 }, at);
   }
@@ -870,6 +876,7 @@ test("hot-standby radar keeps two healthy candidates and replaces a failing one"
     ["TW-7", false, 80],
   ]) {
     state = recordNodeProbe(state, name, { ok, delay }, 200_000);
+    state = recordNodePathProbe(state, name, { ok }, 200_000);
   }
 
   assert.deepEqual(
@@ -879,7 +886,7 @@ test("hot-standby radar keeps two healthy candidates and replaces a failing one"
       210_000,
       { limit: 2 },
     ),
-    ["SG-1", "JP4-HY2"],
+    ["JP4-HY2", "SG-1"],
   );
 });
 

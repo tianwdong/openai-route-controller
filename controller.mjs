@@ -31,15 +31,16 @@ import {
   parseNetworkSetupProxy,
   passiveErrorKey,
   pickEmergencyRecoveryBatch,
-  pickHotStandbyProbeBatch,
   pickProviderRefreshBatch,
   pickRadarBatch,
   pickRecoveryBatch,
   planConnectionDrain,
+  planHotStandbyProbes,
   qualifiesProbeSeries,
   rankHotStandbys,
   rankFreshSuccesses,
   recordCurrentProbe,
+  recordHotStandbyProbeAttempts,
   recordNodePathProbe,
   recordNodeProbe,
   recordProviderHealth,
@@ -151,6 +152,7 @@ const config = {
   radarColdBatchSize: 2,
   activeRadarColdBatchSize: 1,
   hotStandbyCount: 2,
+  hotStandbyExplorationMaxAgeMs: 120_000,
   hotStandbyRequiredPasses: 3,
   hotStandbyProbeTtlMs: 45_000,
   hotStandbyHistoryWindowMs: 90_000,
@@ -407,6 +409,7 @@ async function refreshNetworkEnvironment({ force = false } = {}) {
       const now = Date.now();
       networkTransitionUntil = now + config.networkTransitionGraceMs;
       state = resetStateForNetworkTransition(state, now);
+      nextCurrentProbeAt = now;
       urgentRecovery = true;
       log("warning", "network_path_changed", { from: previousPath, to: currentNetworkPath, graceUntil: networkTransitionUntil });
     }
@@ -482,42 +485,68 @@ function createMihomoRequest(method, requestPath, encodedBody = null) {
 function mihomoRequest(method, requestPath, body, timeoutMs = 5_000) {
   return new Promise((resolve, reject) => {
     const encodedBody = body == null ? null : JSON.stringify(body);
+    const chunks = [];
     let request;
+    let response;
+    let deadline;
+    let settled = false;
+    const onData = (chunk) => chunks.push(chunk);
+    const settle = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      response?.removeListener("data", onData);
+      chunks.length = 0;
+      if (error) {
+        request?.destroy();
+        reject(error);
+      } else {
+        resolve(value);
+      }
+    };
+    const fail = (error) => settle(error);
+    const incompleteResponse = () => fail(
+      new Error(`Mihomo response closed before completion: ${method} ${requestPath}`),
+    );
+
     try {
       request = createMihomoRequest(method, requestPath, encodedBody);
-    } catch (error) {
-      reject(error);
-      return;
-    }
-
-    request.setTimeout(timeoutMs, () => {
-      request.destroy(new Error(`Mihomo request timed out: ${method} ${requestPath}`));
-    });
-
-    request.on("response", (response) => {
-      const chunks = [];
-      response.on("data", (chunk) => chunks.push(chunk));
-      response.on("end", () => {
-        const text = Buffer.concat(chunks).toString("utf8");
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          reject(new Error(`Mihomo ${response.statusCode}: ${text.slice(0, 300)}`));
-          return;
-        }
-        if (!text) {
-          resolve(null);
-          return;
-        }
-        try {
-          resolve(JSON.parse(text));
-        } catch {
-          resolve(text);
-        }
+      // An elapsed-time deadline also bounds responses that keep sending data.
+      deadline = setTimeout(() => {
+        fail(new Error(`Mihomo request timed out: ${method} ${requestPath}`));
+      }, timeoutMs);
+      request.on("error", fail);
+      request.once("response", (incoming) => {
+        response = incoming;
+        // Keep error handlers through close so late transport errors are consumed.
+        response.on("error", fail);
+        response.once("aborted", incompleteResponse);
+        response.once("close", () => {
+          if (!response.complete) incompleteResponse();
+        });
+        response.on("data", onData);
+        response.once("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            fail(new Error(`Mihomo ${response.statusCode}: ${text.slice(0, 300)}`));
+            return;
+          }
+          if (!text) {
+            settle(null, null);
+            return;
+          }
+          try {
+            settle(null, JSON.parse(text));
+          } catch {
+            settle(null, text);
+          }
+        });
       });
-    });
-
-    request.on("error", reject);
-    if (encodedBody) request.write(encodedBody);
-    request.end();
+      if (encodedBody) request.write(encodedBody);
+      request.end();
+    } catch (error) {
+      fail(error);
+    }
   });
 }
 
@@ -559,6 +588,7 @@ async function refreshGroup(source = "mihomo") {
         previous ? "manual" : "startup",
         changedAt,
       );
+      nextCurrentProbeAt = changedAt;
       urgentRecovery = true;
       if (previous) {
         try {
@@ -736,8 +766,11 @@ async function preflightCandidate(name, reason) {
 
 async function checkCurrent() {
   if (currentCheckTask) return currentCheckTask;
+  const current = state.current;
+  const selectedAt = state.currentSelectedAt;
   currentCheckTask = performCurrentCheck().finally(() => {
-    nextCurrentProbeAt = Date.now() + currentProbeDelay();
+    const selectionChanged = state.current !== current || state.currentSelectedAt !== selectedAt;
+    nextCurrentProbeAt = Date.now() + (selectionChanged ? 0 : currentProbeDelay());
     currentCheckTask = null;
   });
   return currentCheckTask;
@@ -752,6 +785,7 @@ async function serviceCurrentDeadline() {
 
 async function performCurrentCheck() {
   const node = state.current;
+  const selectedAt = state.currentSelectedAt;
   const transitionProbe = networkTransitionActive();
   let reportedProviderAlive = null;
   try {
@@ -810,6 +844,11 @@ async function performCurrentCheck() {
   } else {
     result = await curlOpenAIPathProbe();
   }
+  await refreshGroup();
+  if (state.current !== node || state.currentSelectedAt !== selectedAt) {
+    log("info", "current_probe_discarded", { node, reason: "selection_changed" });
+    return false;
+  }
   const now = Date.now();
   if (!result.ok && networkTransitionActive(now)) {
     log("warning", "network_transition_probe_suppressed", {
@@ -856,13 +895,14 @@ async function performCurrentCheck() {
     state.passiveErrors = state.passiveErrors.filter(
       (event) => now - event.at <= config.passiveWindowMs,
     );
-    if (!instabilityReason) {
+    const pendingPassiveFault = state.passiveErrors.length >= config.passiveThreshold;
+    if (!instabilityReason && !pendingPassiveFault) {
       state.nextRecoveryAt = 0;
       state.recoveryExhaustions = 0;
     } else if (state.nextRecoveryAt > 0 || state.recoveryExhaustions > 0) {
       log("warning", "recovery_backoff_preserved", {
         node,
-        reason: instabilityReason,
+        reason: instabilityReason || "passive_transport_errors",
         nextRecoveryAt: state.nextRecoveryAt,
         recoveryExhaustions: state.recoveryExhaustions,
       });
@@ -967,15 +1007,50 @@ function currentRecoveryReason() {
   });
 }
 
-async function selectCandidate(name) {
-  await mihomoRequest(
-    "PUT",
-    `/proxies/${encodeURIComponent(config.groupName)}`,
-    { name },
-  );
+function recoveryAborted(reason) {
+  const error = new Error(reason);
+  error.code = "RECOVERY_ABORTED";
+  return error;
+}
+
+async function assertSelection(expected, selectedAt = null) {
+  await refreshGroup();
+  if (state.current !== expected
+    || (selectedAt != null && state.currentSelectedAt !== selectedAt)) {
+    throw recoveryAborted("selection_or_network_changed");
+  }
+}
+
+async function selectCandidate(name, expected = state.current, selectedAt = state.currentSelectedAt) {
+  await assertSelection(expected, selectedAt);
+  try {
+    await mihomoRequest(
+      "PUT",
+      `/proxies/${encodeURIComponent(config.groupName)}`,
+      { name },
+    );
+  } catch (error) {
+    // A failed response does not prove that the selector rejected the write.
+    await refreshGroup();
+    if (state.current !== expected) {
+      if (state.current === name && state.selectionValidation) {
+        state = beginSelectionValidation(state, expected, name, "controller_unconfirmed", Date.now(), {
+          successThreshold: config.postSwitchProbeCount,
+          failureThreshold: 1,
+          failureAgeMs: 0,
+          maxAgeMs: config.selectionValidationMaxAgeMs,
+        });
+      }
+      throw recoveryAborted("selection_write_unconfirmed");
+    }
+    throw error;
+  }
   const { group } = await refreshGroup("controller");
   if (group.now !== name) {
-    throw new Error(`Selector kept ${group.now} after requesting ${name}`);
+    state = beginSelectionValidation(state, expected, group.now, "external");
+    nextCurrentProbeAt = Date.now();
+    urgentRecovery = true;
+    throw recoveryAborted("selection_changed_after_write");
   }
   try {
     await beginOpenAIConnectionDrain(name);
@@ -1053,13 +1128,15 @@ async function beginOpenAIConnectionDrain(currentNode) {
   return { matched: draining.length, protected: protectedCount };
 }
 
-async function qualifyCandidates(names) {
-  const results = await Promise.all(names.map(async (name) => {
+async function qualifyCandidates(names, checkOrigin = null) {
+  const attempts = await Promise.allSettled(names.map(async (name) => {
     const samples = [];
     const endpoints = [config.endpoint, config.traceEndpoint, config.endpoint];
     for (let attempt = 0; attempt < config.qualificationPasses; attempt += 1) {
       await serviceCurrentDeadline();
+      if (checkOrigin) await checkOrigin();
       const result = await probeNodePath(name, endpoints[attempt % endpoints.length]);
+      if (checkOrigin) await checkOrigin();
       samples.push(result);
       recordCandidateProbe(result);
       if (!result.ok) break;
@@ -1082,6 +1159,13 @@ async function qualifyCandidates(names) {
       sampleCount: samples.length,
     };
   }));
+  // Do not let a rejected sibling leave another qualifier mutating state after
+  // recovery has returned to the main loop.
+  const rejected = attempts.find((attempt) => (
+    attempt.status === "rejected" && attempt.reason?.code === "RECOVERY_ABORTED"
+  )) || attempts.find((attempt) => attempt.status === "rejected");
+  if (rejected) throw rejected.reason;
+  const results = attempts.map((attempt) => attempt.value);
   const sampleCounts = Object.fromEntries(results.map((result) => [
     result.name,
     result.sampleCount,
@@ -1098,8 +1182,10 @@ async function qualifyCandidates(names) {
 }
 
 async function verifySelectedCandidate(name, probeCount = config.postSwitchProbeCount) {
+  const selectedAt = state.currentSelectedAt;
   let lastResult = null;
   for (let attempt = 1; attempt <= probeCount; attempt += 1) {
+    await assertSelection(name, selectedAt);
     let providerAlive = null;
     try {
       providerAlive = await readProxyAlive(name);
@@ -1109,7 +1195,6 @@ async function verifySelectedCandidate(name, probeCount = config.postSwitchProbe
         error: error.message,
       });
     }
-    state = recordProviderHealth(state, providerAlive);
     const result = providerAlive === false && !latestPathProbeWasSuccessful(
       state, name, Date.now(), config.providerFalseConfirmationWindowMs,
     )
@@ -1121,6 +1206,8 @@ async function verifySelectedCandidate(name, probeCount = config.postSwitchProbe
           error: "Mihomo reports this proxy as unavailable",
         }
       : await curlOpenAIPathProbe();
+    await assertSelection(name, selectedAt);
+    state = recordProviderHealth(state, providerAlive);
     if (result.ok && providerAlive === false) {
       state = recordProviderHealth(state, true);
     }
@@ -1169,8 +1256,12 @@ async function rollbackRejectedCandidate(origin, candidate, reason) {
   }
 
   try {
-    await selectCandidate(origin.current);
+    await selectCandidate(origin.current, candidate);
     state = restoreRecoveryOrigin(state, origin);
+    state.passiveErrors = [...new Map([
+      ...(origin.passiveErrors || []), ...state.passiveErrors,
+    ].filter((event) => Date.now() - event.at <= config.passiveWindowMs)
+      .map((event) => [event.key, event])).values()];
     log("warning", "recovery_candidate_rolled_back", {
       reason,
       from: candidate,
@@ -1179,6 +1270,7 @@ async function rollbackRejectedCandidate(origin, candidate, reason) {
     });
     return true;
   } catch (error) {
+    if (error.code === "RECOVERY_ABORTED") throw error;
     log("error", "recovery_rollback_failed", {
       reason,
       from: candidate,
@@ -1214,6 +1306,7 @@ async function completeRecovery(
   options = {},
 ) {
   const { backgroundValidation = false } = options;
+  await assertSelection(candidate);
   const verifiedAt = Date.now();
   state.passiveErrors = [];
   state.nextRecoveryAt = 0;
@@ -1246,6 +1339,7 @@ async function completeRecovery(
       error: error.message,
     });
   }
+  await assertSelection(candidate);
   log("warning", "recovery_complete", {
     reason,
     from: before,
@@ -1274,8 +1368,19 @@ async function recover(reason) {
     lastFailureAt: state.lastFailureAt,
     providerAlive: state.providerAlive,
     providerUnhealthyAt: state.providerUnhealthyAt,
+    passiveErrors: [...state.passiveErrors],
   };
   const recoveryAt = Date.now();
+  const checkOrigin = async () => {
+    await assertSelection(before, origin.currentSelectedAt);
+    if (networkTransitionActive()) throw recoveryAborted("network_transition");
+    // Short successes cannot resolve the long-connection failures that started
+    // this attempt. Other faults may be cancelled by a new real recovery.
+    if (reason !== "passive_transport_errors"
+      && state.lastSuccessAt > recoveryAt && !currentRecoveryReason()) {
+      throw recoveryAborted("current_path_recovered");
+    }
+  };
   recoveryStartedWithActiveTraffic = hasRecentTraffic(
     state, recoveryAt, config.activeTrafficGraceMs,
   );
@@ -1283,12 +1388,13 @@ async function recover(reason) {
   state.lastRecoveryReason = reason;
   state.nextRecoveryAt = 0;
   state.holdUntil = 0;
-  state.passiveErrors = [];
 
   if (shadowMode) {
     log("warning", "shadow_recovery", { reason, current: before });
     return false;
   }
+
+  await checkOrigin();
 
   const alreadyCooling = (state.nodes[before]?.excludedUntil || 0) > recoveryAt;
   state = ejectNodeOnce(state, before, recoveryAt, config.ejectionDurationsMs);
@@ -1330,7 +1436,7 @@ async function recover(reason) {
         candidates: refreshBatch,
       });
       state = recordProviderRefreshAttempts(state, refreshBatch);
-      refreshedQualified = await qualifyCandidates(refreshBatch);
+      refreshedQualified = await qualifyCandidates(refreshBatch, checkOrigin);
       proxySnapshot = await mihomoRequest("GET", "/proxies");
       providerAliveCandidates = routeAliveCandidates(
         candidates,
@@ -1357,13 +1463,17 @@ async function recover(reason) {
   log("info", "provider_candidate_filter", {
     candidates: candidates.length,
     alive: providerAliveCandidates.length,
-    rejected: candidates.length - providerAliveCandidates.length,
+    eligible: candidates.length,
+    rejected: 0,
     refreshAttempted: refreshBatch.length,
     refreshQualified: refreshedQualified.length,
   });
+  // Shared native health can be stale or changed by a user's speed test.
+  // Keep it as refresh telemetry, never as admission to independent validation.
+  const recoveryCandidates = [...new Set(candidates)];
   const tested = [];
   const radarReadyStandbys = rankHotStandbys(
-    providerAliveCandidates,
+    recoveryCandidates,
     state,
     Date.now(),
     {
@@ -1396,12 +1506,15 @@ async function recover(reason) {
 
   for (const candidateName of hotStandbys) {
     tested.push(candidateName);
+    await checkOrigin();
     if (!await preflightCandidate(candidateName, reason)) continue;
-    await selectCandidate(candidateName);
+    await checkOrigin();
+    await selectCandidate(candidateName, before, origin.currentSelectedAt);
     let verification;
     try {
       verification = await verifySelectedCandidate(candidateName, 1);
     } catch (error) {
+      if (error.code === "RECOVERY_ABORTED") throw error;
       await rollbackRejectedCandidate(origin, candidateName, reason);
       throw error;
     }
@@ -1439,7 +1552,7 @@ async function recover(reason) {
 
   const attemptedHotStandbys = new Set(hotStandbys);
   const candidatePools = buildRecoveryCandidatePools(
-    providerAliveCandidates,
+    recoveryCandidates,
     attemptedHotStandbys,
     downgradedStandbys,
   );
@@ -1462,9 +1575,9 @@ async function recover(reason) {
       remaining = remaining.filter((name) => !batchNames.has(name));
       tested.push(...batch);
 
-      const qualified = await qualifyCandidates(batch);
+      const qualified = await qualifyCandidates(batch, checkOrigin);
       await serviceCurrentDeadline();
-      if (!currentRecoveryReason()) return false;
+      await checkOrigin();
       const ranked = rankFreshSuccesses(
         qualified,
         state,
@@ -1481,12 +1594,15 @@ async function recover(reason) {
       });
 
       for (const candidate of ranked) {
+        await checkOrigin();
         if (!await preflightCandidate(candidate.name, reason)) continue;
-        await selectCandidate(candidate.name);
+        await checkOrigin();
+        await selectCandidate(candidate.name, before, origin.currentSelectedAt);
         let verification;
         try {
           verification = await verifySelectedCandidate(candidate.name);
         } catch (error) {
+          if (error.code === "RECOVERY_ABORTED") throw error;
           await rollbackRejectedCandidate(origin, candidate.name, reason);
           throw error;
         }
@@ -1520,7 +1636,7 @@ async function recover(reason) {
   if (allowsEmergencyCoolingReuse(reason)) {
     const testedNames = new Set(tested);
     const emergencyBatch = pickEmergencyRecoveryBatch(
-      providerAliveCandidates.filter((name) => !testedNames.has(name)),
+      recoveryCandidates.filter((name) => !testedNames.has(name)),
       state,
       Date.now(),
       {
@@ -1535,7 +1651,7 @@ async function recover(reason) {
         reason,
         candidates: emergencyBatch,
       });
-      const qualified = await qualifyCandidates(emergencyBatch);
+      const qualified = await qualifyCandidates(emergencyBatch, checkOrigin);
       const ranked = rankFreshSuccesses(
         qualified,
         state,
@@ -1546,12 +1662,15 @@ async function recover(reason) {
       );
 
       for (const candidate of ranked) {
+        await checkOrigin();
         if (!await preflightCandidate(candidate.name, reason)) continue;
-        await selectCandidate(candidate.name);
+        await checkOrigin();
+        await selectCandidate(candidate.name, before, origin.currentSelectedAt);
         let verification;
         try {
           verification = await verifySelectedCandidate(candidate.name);
         } catch (error) {
+          if (error.code === "RECOVERY_ABORTED") throw error;
           await rollbackRejectedCandidate(origin, candidate.name, reason);
           throw error;
         }
@@ -1598,20 +1717,35 @@ async function maybeRecover() {
   let reason = currentRecoveryReason();
   if (!reason) return false;
   if (reason === "active_current_probe_validation") {
+    const confirming = state.current;
+    const selectedAt = state.currentSelectedAt;
     log("warning", "active_failure_confirmation", {
       node: state.current,
       failures: state.currentFailures,
       firstFailureAt: state.currentFailureStartedAt,
     });
-    if (await checkCurrent()) {
+    const healthy = await checkCurrent();
+    if (state.current !== confirming || state.currentSelectedAt !== selectedAt
+      || networkTransitionActive()) {
+      log("info", "active_failure_confirmation_discarded", { node: confirming });
+      return false;
+    }
+    if (healthy) {
       log("info", "active_failure_cleared", { node: state.current });
       return false;
     }
     reason = "active_current_probe_failures";
   }
+  const recovering = state.current;
+  const selectedAt = state.currentSelectedAt;
   try {
     return await recover(reason);
   } catch (error) {
+    if (error.code === "RECOVERY_ABORTED" || state.current !== recovering
+      || state.currentSelectedAt !== selectedAt) {
+      log("info", "recovery_aborted", { reason: error.message, current: state.current });
+      return false;
+    }
     const retryInMs = scheduleRecoveryRetry(reason);
     log("error", "recovery_failed", {
       reason,
@@ -1652,24 +1786,40 @@ async function runRadar(candidates) {
 }
 
 async function runHotStandbyRadar(candidates) {
-  const proxySnapshot = await mihomoRequest("GET", "/proxies");
-  const providerAliveCandidates = routeAliveCandidates(
-    candidates,
-    proxySnapshot?.proxies,
-  );
-  const batch = pickHotStandbyProbeBatch(
-    providerAliveCandidates,
+  const independentCandidates = [...new Set(candidates)];
+  const readyOptions = {
+    limit: config.hotStandbyCount,
+    requiredPasses: config.hotStandbyRequiredPasses,
+    probeTtlMs: config.hotStandbyProbeTtlMs,
+    historyWindowMs: config.hotStandbyHistoryWindowMs,
+    minSpanMs: config.hotStandbyMinSpanMs,
+    rollingWindowMs: config.rollingWindowMs,
+    pathHistoryWindowMs: config.pathHistoryWindowMs,
+  };
+  const fastOptions = {
+    requiredPasses: config.hotStandbyFastPathRequiredPasses,
+    historyWindowMs: config.hotStandbyFastPathHistoryWindowMs,
+    probeTtlMs: config.hotStandbyFastPathProbeTtlMs,
+    minSpanMs: config.hotStandbyFastPathMinSpanMs,
+  };
+  const plan = planHotStandbyProbes(
+    independentCandidates,
     state,
     Date.now(),
     {
       limit: config.hotStandbyCount,
       rollingWindowMs: config.rollingWindowMs,
       pathHistoryWindowMs: config.pathHistoryWindowMs,
+      readyOptions,
+      fastOptions,
+      explorationMaxAgeMs: config.hotStandbyExplorationMaxAgeMs,
     },
   );
+  const { batch } = plan;
+  state.hotStandbyExploration = plan.exploration;
   if (batch.length === 0) {
     log("warning", "hot_standby_unavailable", {
-      providerAliveCandidates: providerAliveCandidates.length,
+      candidates: independentCandidates.length,
     });
     return;
   }
@@ -1677,40 +1827,62 @@ async function runHotStandbyRadar(candidates) {
   const endpoints = [config.endpoint, config.traceEndpoint, config.endpoint];
   const endpoint = endpoints[hotStandbyProbeRound % endpoints.length];
   hotStandbyProbeRound += 1;
-  const results = await Promise.all(batch.map(async (name) => {
-    const shortProbe = await probeNode(name, endpoint);
-    return shortProbe.ok ? probeNodePath(name) : shortProbe;
-  }));
+  const plannedCurrent = state.current;
+  const plannedSelectedAt = state.currentSelectedAt;
+  state = recordHotStandbyProbeAttempts(state, batch, Date.now());
+  const attempts = await Promise.allSettled(batch.map((name) => probeNodePath(name, endpoint)));
+  const results = attempts
+    .filter((attempt) => attempt.status === "fulfilled")
+    .map((attempt) => attempt.value);
   for (const result of results) {
     recordCandidateProbe(result);
   }
+  const rejected = attempts.find((attempt) => attempt.status === "rejected");
+  if (rejected) {
+    state.hotStandbyExploration = null;
+    throw rejected.reason;
+  }
+  let latestCandidates;
+  try {
+    ({ candidates: latestCandidates } = await refreshGroup());
+  } catch (error) {
+    state.hotStandbyExploration = null;
+    throw error;
+  }
   const ready = rankHotStandbys(
-    providerAliveCandidates,
+    latestCandidates,
     state,
     Date.now(),
-    {
-      limit: config.hotStandbyCount,
-      requiredPasses: config.hotStandbyRequiredPasses,
-      probeTtlMs: config.hotStandbyProbeTtlMs,
-      historyWindowMs: config.hotStandbyHistoryWindowMs,
-      minSpanMs: config.hotStandbyMinSpanMs,
-      rollingWindowMs: config.rollingWindowMs,
-      pathHistoryWindowMs: config.pathHistoryWindowMs,
-    },
+    readyOptions,
   );
   const fastReady = ready.filter((name) => (
-    hasRecentStablePathEvidence(state, name, Date.now(), {
-      requiredPasses: config.hotStandbyFastPathRequiredPasses,
-      historyWindowMs: config.hotStandbyFastPathHistoryWindowMs,
-      probeTtlMs: config.hotStandbyFastPathProbeTtlMs,
-      minSpanMs: config.hotStandbyFastPathMinSpanMs,
-    })
+    hasRecentStablePathEvidence(state, name, Date.now(), fastOptions)
   ));
+  if (state.hotStandbyExploration) {
+    const result = results.find((item) => item.name === state.hotStandbyExploration.name);
+    const mappingChanged = JSON.stringify([...independentCandidates].sort())
+      !== JSON.stringify([...new Set(latestCandidates)].sort());
+    const reason = mappingChanged ? "candidate_routes_changed"
+      : state.current !== plannedCurrent || state.currentSelectedAt !== plannedSelectedAt
+        ? "selection_changed"
+        : !result || result.infrastructureError ? "probe_unavailable"
+          : !result.ok ? "path_failed"
+            : fastReady.length > 0 ? "fast_standby_ready" : null;
+    if (reason) {
+      log("info", "hot_standby_exploration_finished", {
+        node: state.hotStandbyExploration.name,
+        reason,
+      });
+      state.hotStandbyExploration = null;
+    }
+  }
   log(ready.length > 0 ? "info" : "warning", "hot_standby_radar", {
     tested: batch,
     successful: results.filter((result) => result.ok).map((result) => result.name),
     ready,
     fastReady,
+    exploration: plan.exploration?.name || null,
+    explorationPending: state.hotStandbyExploration?.name || null,
     target: config.hotStandbyCount,
     endpoint: endpoint.url,
   });

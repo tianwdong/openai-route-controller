@@ -14,9 +14,9 @@ Clash 全局脚本创建一个普通 Selector，并为每个候选创建一个�
 
 ### Mihomo 健康信号
 
-`alive` 和 delay API 用于快速排除明显不可达节点，但不单独证明 OpenAI 路径可用。若当前节点刚在 60 秒内完成过完整路径探针，单次 `alive:false` 会触发一次真实路径确认；确认成功则记录 `provider_health_false_overridden`，确认失败才熔断。没有执行真实请求时生成的 `provider_unhealthy` 只属于 provider 信号，不得写入 `pathEvents`，避免健康缓存过期被误算成多次真实路径失败。
+`alive` 和 delay API 提供当前节点健康提示及冷扫描信号，不作为恢复候选或热备的准入条件。共享缓存可被其他组或人工测速改写，不能单独证明 OpenAI 路径可用。若当前节点刚在 60 秒内完成过完整路径探针，单次 `alive:false` 会触发一次真实路径确认；确认成功则记录 `provider_health_false_overridden`，确认失败才熔断。没有执行真实请求时生成的 `provider_unhealthy` 只属于 provider 信号，不得写入 `pathEvents`，避免健康缓存过期被误算成多次真实路径失败。
 
-当 provider-alive 候选少于 3 个，或上一轮恢复已耗尽时，恢复流程每轮检查最多 3 个陈旧候选。排序优先尚未扫描和最久未扫描，独立记录 lastProviderRefreshAt，避免历史评分或地区分桶让少数失败节点反复占用名额。资格检查的短请求和完整路径均使用固定节点监听器，不依赖 delay API 成功。通过三轮独立资格验证的节点可在共享 alive 仍为 false 时进入恢复候选池，之后继续遵守冷却、即时复核、切换后四次验证和回滚规则；不会直接切换或修改共享健康缓存。
+每轮恢复均从完整候选池进行独立验证，每批最多 3 个，保留冷却、历史排序及当前监测检查点。即使缓存标绿的节点超过 3 个，也不会排除 `alive:false` 的候选。当 provider-alive 候选少于 3 个，或上一轮恢复已耗尽时，额外优先检查最多 3 个陈旧候选；排序优先尚未扫描和最久未扫描，独立记录 lastProviderRefreshAt。资格检查的短请求和完整路径均使用固定节点监听器，不依赖 delay API 成功；三轮资格检查、即时复核、切换后四次验证和回滚规则保持有效。`provider_candidate_filter` 的 `alive` 仅记录缓存或优先资格结果，`eligible` 表示完整候选池，`rejected` 为 0；冷却等后续条件仍会排除候选。
 
 ### OpenAI 入口探针
 
@@ -72,7 +72,13 @@ macOS 的系统代理按网络服务保存。有线服务启用了代理，并�
 
 候选排序以完整路径历史为先，使用半衰期 30 分钟的时间加权成功率及平滑先验，未知节点的先验为 0.5。一条历史失败不会把长期稳定节点排到未知节点之后，陈旧成功也不能持续掩盖新故障。雷达延迟只用于同等证据下的末级排序，不能清除 `pathEvents` 中的失败，也不能让一个只有绿色延迟的节点直接快速接管。
 
-热备每轮先通过 HEAD，再通过独立入口读取 Codex 入口和完整 Usage 响应体；只有最近 10 分钟的完整路径全成功、至少 4 次且跨度 45 秒、最新成功不超过 2 分钟，才具备快速接管资格。冷雷达与热备恰好同时成功不会抹掉已有的连续成功时间跨度。本机探测端口缺失或候选映射在探测中变化时记录基础设施错误，不处罚节点。
+热备每 20 秒最多并行检查 2 个候选，从完整候选池选择，不读取共享 `alive`，也不要求原生 delay 成功。轮换短请求、Codex 入口和完整 Usage 响应体均经节点独立入口验证；只有最近 10 分钟的完整路径全成功、至少 4 次且跨度 45 秒、最新成功不超过 2 分钟，才具备快速接管资格。冷雷达与热备恰好同时成功不会抹掉已有的连续成功时间跨度。本机探测端口缺失或候选映射在探测中变化时记录基础设施错误，不处罚节点。
+
+热备排序使用完整路径自身的连续失败与质量证据，普通热备的三次连续成功也只从 `pathEvents` 计算。冷雷达的一次短成功或短失败不能重置完整路径的失败事实，也不能补足热备时序资格。既有 `probeEvents` 和混合计数继续用于短探测统计，持久状态无需清空或升级版本。
+
+没有快速热备时，两个完整探测名额中保留一个用于连续探索，按完整探测及独立尝试时间优先重查长期未验证的候选。首次成功后继续给同一候选积累三／四次时序证据；另一个名额按完整路径质量维护。已存在快速热备时优先维护它，不新开探索。当前节点和冷却节点始终不进入热备采样。
+
+探索预约最长 120 秒。真实失败、本机探测不可用、候选映射变化、预约节点被选中／移除／进入冷却，或取得快速热备时结束预约。每次完整探测发起前单独写入 `lastHotStandbyProbeAt`，因此基础设施失败不会被当作节点路径失败，也不能无限占据最旧候选的位置。预约和尝试时间随状态保存；控制器重启不清空原有失败历史或冷却。
 
 ## 当前节点熔断
 
@@ -94,10 +100,8 @@ macOS 的系统代理按网络服务保存。有线服务启用了代理，并�
 ```text
 完整候选池
   │
-  ├─ Mihomo alive:false ────────> 存活池不足时，最多刷新 3 个
-  │                                      │
-  │                                      ├─ 独立资格未通过 ──> 本轮排除
-  │                                      └─ 恢复可达 ────────> 回到严格资格验证
+  ├─ Mihomo alive:false ────────> 保留在独立验证候选池
+  │                               缓存池不足或恢复耗尽时额外优先刷新
   │
   ├─ 热备且完整路径历史新鲜、干净 ──────> 1 次即时复核
   │                                         │
@@ -170,3 +174,23 @@ to current monitoring deadlines; overdue checks also run between radar batches.
 Network/selector recovery state is not mutated concurrently by background jobs.
 Long individual requests can delay a checkpoint, but repeated forced system
 checks no longer monopolize the monitoring loop.
+
+### Recovery ownership and incomplete responses
+
+An attempt retains its origin selection tenure and passive fault evidence.
+Selector changes or confirmed network changes invalidate that origin. A new
+current-path success can cancel other recovery reasons, but cannot by itself
+resolve passive long-connection errors. Cancellation is not a node failure and
+must not schedule the origin's backoff against a newly observed manual selection.
+
+Isolated qualification, guarded selection, and four live validation probes remain
+separate stages. Live results are attributed only if selection is unchanged when
+rechecked. Rejected candidate rollback retains the origin's recent passive errors.
+Uncertain selector writes are reconciled and require the full four-success
+validation before verification; no completion is inferred from a submitted PUT.
+
+All local API promises settle on completion, response failure, or an elapsed-time
+deadline. Parallel qualification settles all siblings before the serial loop
+resumes. These properties prevent abandoned callbacks from updating recovery state
+after an attempt has already been cancelled. GET/PUT guards do not provide atomic
+ownership against an independent writer; see the configuration reference.

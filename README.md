@@ -171,6 +171,8 @@ rm -rf "$SHADOW_DIR"
 - `candidate_preflight`：切换前的独立完整路径即时复核；
 - `candidate_probe_unavailable`：本机探测入口或映射有问题，该结果不处罚候选；
 - `hot_standby_radar.fastReady`：具备新鲜完整路径证据的快速热备；
+- `hot_standby_radar.exploration`／`explorationPending`：本轮连续探索候选及探测后的预约；
+- `hot_standby_exploration_finished`：探索因成功、失败、基础设施问题或选择／映射变化而结束；
 - `provider_health_false_overridden`：Mihomo 单次判死被完整路径复核覆盖；
 - `provider_cache_refresh_started`／`provider_cache_refresh_complete`：低存活池正在独立检查少量陈旧候选；
 - `recovery_woken_by_hot_standby`：热备已恢复，控制器提前结束退避；

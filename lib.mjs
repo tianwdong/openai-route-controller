@@ -18,6 +18,7 @@ function newNodeState() {
     lastFailureAt: 0,
     lastProbeAt: 0,
     lastProviderRefreshAt: 0,
+    lastHotStandbyProbeAt: 0,
     excludedUntil: 0,
     ejectionCount: 0,
     penaltyRecoveryStartedAt: 0,
@@ -44,6 +45,7 @@ export function newWatchdogState() {
     providerUnhealthyAt: 0,
     lastOpenAITrafficAt: 0,
     selectionValidation: null,
+    hotStandbyExploration: null,
     passiveErrors: [],
     nodes: {},
   };
@@ -59,6 +61,9 @@ export function normalizeState(saved) {
     nodes[name] = {
       ...newNodeState(),
       ...node,
+      lastHotStandbyProbeAt: Number.isFinite(Number(node.lastHotStandbyProbeAt))
+        ? Math.max(0, Number(node.lastHotStandbyProbeAt))
+        : 0,
       probeEvents: Array.isArray(node.probeEvents) ? node.probeEvents : [],
       pathEvents: Array.isArray(node.pathEvents) ? node.pathEvents : [],
     };
@@ -81,6 +86,15 @@ export function normalizeState(saved) {
             ? Number(saved.selectionValidation.failureAgeMs)
             : 5_000,
           maxAgeMs: Number(saved.selectionValidation.maxAgeMs) || 30_000,
+        }
+      : null,
+    hotStandbyExploration: typeof saved.hotStandbyExploration?.name === "string"
+      && typeof saved.hotStandbyExploration.candidateKey === "string"
+      && Number.isFinite(Number(saved.hotStandbyExploration.startedAt))
+      ? {
+          name: saved.hotStandbyExploration.name,
+          startedAt: Number(saved.hotStandbyExploration.startedAt),
+          candidateKey: saved.hotStandbyExploration.candidateKey,
         }
       : null,
     passiveErrors: Array.isArray(saved.passiveErrors) ? saved.passiveErrors : [],
@@ -918,14 +932,14 @@ export function pickRadarBatch(candidates, state, now = Date.now(), options = {}
   return [...hot, ...cold];
 }
 
-function recentSuccessfulSeries(node, now, options = {}) {
+function recentPathSuccessfulSeries(node, now, options = {}) {
   const {
     requiredPasses = 3,
     probeTtlMs = 75_000,
     historyWindowMs = 3 * 60_000,
     minSpanMs = 45_000,
   } = options;
-  const history = [...(node.probeEvents || [])]
+  const history = [...(node.pathEvents || [])]
     .filter((event) => now - event.at <= historyWindowMs)
     .sort((left, right) => left.at - right.at);
   const samples = history.slice(history.findLastIndex((event) => !event.ok) + 1);
@@ -937,6 +951,28 @@ function recentSuccessfulSeries(node, now, options = {}) {
     && newest.at - oldest.at >= minSpanMs;
 }
 
+function hotStandbyPathStats(node, now, windowMs) {
+  const events = recentPathEvents(node, now, windowMs)
+    .sort((left, right) => left.at - right.at);
+  let consecutiveFailures = 0;
+  for (let index = events.length - 1; index >= 0 && !events[index].ok; index -= 1) {
+    consecutiveFailures += 1;
+  }
+  return {
+    ...rollingPathStats(node, now, windowMs),
+    consecutiveFailures,
+    lastSuccessAt: events.findLast((event) => event.ok)?.at || 0,
+  };
+}
+
+function compareHotStandbyHealth(left, right) {
+  return left.path.consecutiveFailures - right.path.consecutiveFailures
+    || right.path.weightedReliability - left.path.weightedReliability
+    || left.node.ejectionCount - right.node.ejectionCount
+    || right.path.lastSuccessAt - left.path.lastSuccessAt
+    || left.name.localeCompare(right.name);
+}
+
 export function rankHotStandbys(
   candidates,
   state,
@@ -945,27 +981,19 @@ export function rankHotStandbys(
 ) {
   const {
     limit = 2,
-    rollingWindowMs = DEFAULT_ROLLING_WINDOW_MS,
     pathHistoryWindowMs = DEFAULT_PATH_HISTORY_WINDOW_MS,
   } = options;
   return [...new Set(candidates)]
     .filter((name) => name && name !== state.current)
-    .map((name) => ({
-      name,
-      node: { ...newNodeState(), ...(state.nodes[name] || {}) },
-    }))
+    .map((name) => {
+      const node = { ...newNodeState(), ...(state.nodes[name] || {}) };
+      return { name, node, path: hotStandbyPathStats(node, now, pathHistoryWindowMs) };
+    })
     .filter(({ node }) => (
       node.excludedUntil <= now
-      && node.consecutiveFailures === 0
-      && recentSuccessfulSeries(node, now, options)
+      && recentPathSuccessfulSeries(node, now, options)
     ))
-    .sort((left, right) => compareNodeHealth(
-      left,
-      right,
-      now,
-      rollingWindowMs,
-      pathHistoryWindowMs,
-    ))
+    .sort(compareHotStandbyHealth)
     .slice(0, limit)
     .map(({ name }) => name);
 }
@@ -978,27 +1006,87 @@ export function pickHotStandbyProbeBatch(
 ) {
   const {
     limit = 2,
-    rollingWindowMs = DEFAULT_ROLLING_WINDOW_MS,
     pathHistoryWindowMs = DEFAULT_PATH_HISTORY_WINDOW_MS,
   } = options;
   const ranked = [...new Set(candidates)]
     .filter((name) => name && name !== state.current)
-    .map((name) => ({
-      name,
-      node: { ...newNodeState(), ...(state.nodes[name] || {}) },
-    }))
+    .map((name) => {
+      const node = { ...newNodeState(), ...(state.nodes[name] || {}) };
+      return { name, node, path: hotStandbyPathStats(node, now, pathHistoryWindowMs) };
+    })
     .filter(({ node }) => node.excludedUntil <= now)
-    .sort((left, right) => (
-      left.node.consecutiveFailures - right.node.consecutiveFailures
-      || compareNodeHealth(
-        left,
-        right,
-        now,
-        rollingWindowMs,
-        pathHistoryWindowMs,
-      )
-    ));
+    .sort(compareHotStandbyHealth);
   return ranked.slice(0, limit).map(({ name }) => name);
+}
+
+export function recordHotStandbyProbeAttempts(state, names, now = Date.now()) {
+  const nodes = { ...state.nodes };
+  for (const name of new Set(names.filter(Boolean))) {
+    nodes[name] = { ...newNodeState(), ...nodes[name], lastHotStandbyProbeAt: now };
+  }
+  return { ...state, nodes };
+}
+
+export function planHotStandbyProbes(candidates, state, now = Date.now(), options = {}) {
+  const { limit = 2, explorationMaxAgeMs = 120_000 } = options;
+  const capacity = Math.max(0, Math.min(2, Math.floor(limit)));
+  const pool = [...new Set(candidates)].filter(Boolean);
+  const candidateKey = JSON.stringify([...pool].sort());
+  const quality = pickHotStandbyProbeBatch(pool, state, now, { ...options, limit: pool.length });
+  const readyOptions = {
+    requiredPasses: 3,
+    probeTtlMs: 45_000,
+    historyWindowMs: 90_000,
+    minSpanMs: 35_000,
+    ...options.readyOptions,
+    limit: pool.length,
+  };
+  const ready = rankHotStandbys(quality, state, now, readyOptions);
+  const fastReady = ready.filter((name) => (
+    hasRecentStablePathEvidence(state, name, now, options.fastOptions)
+  ));
+  if (fastReady.length > 0) {
+    const fastNames = new Set(fastReady);
+    return {
+      batch: [...fastReady, ...quality.filter((name) => !fastNames.has(name))].slice(0, capacity),
+      exploration: null,
+    };
+  }
+  if (capacity < 2 || quality.length < 2) {
+    return { batch: quality.slice(0, capacity), exploration: null };
+  }
+
+  const previous = state.hotStandbyExploration;
+  let exploration = null;
+  if (previous && quality.includes(previous.name) && previous.candidateKey === candidateKey
+    && previous.startedAt <= now && now - previous.startedAt < explorationMaxAgeMs) {
+    const node = state.nodes[previous.name] || newNodeState();
+    const lastAttemptAt = node.lastHotStandbyProbeAt || 0;
+    const latestPath = [...(node.pathEvents || [])].sort((left, right) => left.at - right.at).at(-1);
+    // The controller plans only after the preceding batch settled. An attempt
+    // without a real path result is infrastructure failure, not node failure.
+    const attemptFailed = lastAttemptAt >= previous.startedAt
+      && (!latestPath || latestPath.at < lastAttemptAt || !latestPath.ok);
+    if (!attemptFailed) exploration = { ...previous };
+  }
+  if (!exploration) {
+    const unexplored = quality.filter((name) => name !== previous?.name);
+    const lastAttemptAt = (name) => {
+      const node = state.nodes[name] || newNodeState();
+      return Math.max(node.lastHotStandbyProbeAt || 0,
+        ...(node.pathEvents || []).map((event) => event.at));
+    };
+    unexplored.sort((left, right) => lastAttemptAt(left) - lastAttemptAt(right)
+      || left.localeCompare(right));
+    if (unexplored.length > 0) {
+      exploration = { name: unexplored[0], startedAt: now, candidateKey };
+    }
+  }
+  if (!exploration) return { batch: quality.slice(0, capacity), exploration: null };
+  return {
+    batch: [...quality.filter((name) => name !== exploration.name).slice(0, 1), exploration.name],
+    exploration,
+  };
 }
 
 export function rankFreshSuccesses(

@@ -14,7 +14,7 @@
   "homepage": "https://github.com/tianwdong/openai-route-controller#readme",
   "type": "module",
   "scripts": {
-    "test": "node --test controller.test.mjs controller.integration.test.mjs script.test.mjs",
+    "test": "node --test controller.test.mjs controller.integration.test.mjs script.test.mjs history.test.mjs scheduler.test.mjs transport.test.mjs recovery.test.mjs cache.test.mjs standby.test.mjs standby.integration.test.mjs",
     "check": "node --check controller.mjs && node --check lib.mjs && node --check Script.openai.js",
     "verify": "npm test && npm run check"
   },

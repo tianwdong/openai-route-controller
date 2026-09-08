@@ -35,10 +35,14 @@
 | 隔离处罚恢复 | 连续 30 分钟完整路径成功降一级；采样间隔最多 2 分钟，不缩短当前隔离 |
 | macOS 切网保护 | 20 秒内不累计当前路径失败或被动错误；每 3 秒复核原节点，成功后提前结束 |
 | 旧连接排空 | 记录旧出口连接并忽略其后续错误，不主动删除连接 |
+| 热备探索 | 无快速热备时，两个并发名额中保留一个连续探索名额 |
+| 单次探索预约 | 最长 120 秒；失败、基础设施不可用、候选或选择变化时释放 |
 
-provider 恢复扫描优先选择未扫描、最久未扫描的候选，单独记录每次尝试，避免基础设施错误或地区分桶导致反复占用名额。候选通过独立监听完成三轮资格验证后，即使共享 `alive:false` 未更新，也可进入正常恢复候选池；冷却、切换前即时复核、切换后验证和回滚规则仍然有效。
+正常恢复与热备均从完整候选池选择，不以共享 `alive` 或原生 delay 成功作为准入条件。正常恢复每批最多并行验证 3 个；热备每 20 秒最多并行验证 2 个，轮换短请求及完整路径均使用独立监听。表中的 provider 缓存刷新是额外的优先扫描，优先选择未扫描、最久未扫描的候选，单独记录每次尝试。三轮资格检查、冷却、切换前即时复核、切换后验证和回滚规则仍然有效。
 
 冷候选扫描在启动后执行一轮，之后每 60 秒重查最久未测的候选：最近 2 分钟有 OpenAI 流量时每轮 1 个，空闲时每轮 2 个。持续使用不会无限暂停扫描；当前节点和仍在冷却期的节点不进入这一后台扫描。
+
+热备排序和资格只使用完整路径的连续成败与时序证据，冷扫描的短成功不能抹去完整失败。探索名额按最后完整探测／尝试时间轮转，成功候选连续验证至满足既有资格；存在快速热备时保留其维护名额。探索不增加并发，不改变三轮资格、四次切换验证或冷却。
 
 ## Clash 组约束
 
@@ -62,7 +66,7 @@ provider 恢复扫描优先选择未扫描、最久未扫描的候选，单独�
 | 端点 | 预期 | 用途 |
 |---|---|---|
 | `https://chatgpt.com/backend-api/codex/responses` | `405` | OpenAI／Codex 入口和 TLS 可达性 |
-| `https://chatgpt.com/cdn-cgi/trace` | HEAD 返回 `200` | 热备轮换短探针 |
+| `https://chatgpt.com/cdn-cgi/trace` | 返回 `200` 且至少 100 bytes | 热备独立入口轮换探针 |
 | `https://chatgpt.com/codex/settings/usage` | `200` 或 `403` 且至少 3000 bytes | 完整响应体读取 |
 
 这些状态只用于网络路径判定。真实业务请求的 `403` 不是成功。
@@ -120,11 +124,41 @@ Current-path monitoring has an independent due time. Candidate qualification
 checks this deadline between attempts and batches, and background radar yields
 to an overdue current check. Repeated passive errors do not keep postponing that
 deadline. Current checks are single-flight; selector mutation and post-switch
-validation remain serial. Ordinary local Mihomo requests time out after 5 seconds;
-native delay tests retain their explicit timeout. The design is cooperative:
+validation remain serial. A confirmed network transition or observed manual
+selection makes the current check immediately due, including when the event is
+noticed during an in-flight check. Ordinary local Mihomo requests have a 5-second
+elapsed-time deadline, including continuously arriving response bytes; truncated
+or prematurely closed responses reject immediately. Native delay tests retain
+their explicit timeout. The design is cooperative:
 one in-flight request can still delay a scheduled check; it is not a hard real-time
 guarantee. Post-switch probes also count as current-path monitoring.
 
 `current_probe_deadline_serviced` includes `overdueMs` to expose delay, and
 `network_path_read_failed` reports a failed route command without calling it a
 confirmed network transition.
+
+## Recovery cancellation and external selection
+
+Passive transport evidence survives successful short probes and remains attached
+to an in-progress recovery. Short successes do not reset the backoff while the
+passive threshold remains met. A failed candidate rollback restores only recent
+passive evidence from the origin. Parallel qualification waits for every sibling
+to settle; cancellation takes precedence over a concurrent probe error.
+
+Recovery checks the expected selector and selection tenure around qualification,
+preflight, live validation, and completion. An observed external change cancels
+the old attempt, synchronizes the actual choice, and starts its validation without
+charging the old failure or retry delay to it. Live results spanning such a change
+are discarded. A selector write whose response is lost is reconciled before
+another write; an observed accepted candidate needs four successful current checks
+with a one-failure limit before it can be considered verified.
+
+These checks detect observed changes; the Mihomo selector GET and PUT operations
+are not an atomic compare-and-swap. Another writer can still race in the final
+read/write window or make an unobserved change and change back. Do not interpret
+the guards as an exclusive cross-process lock or proof of streaming health.
+
+`recovery_aborted`, `current_probe_discarded`, and
+`active_failure_confirmation_discarded` distinguish invalidated work from a real
+probe failure. `controller_unconfirmed` identifies validation after a write with
+an uncertain response; it is not a manual selection or completed recovery.
