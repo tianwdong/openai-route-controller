@@ -6,8 +6,12 @@ import http from "node:http";
 import https from "node:https";
 import os from "node:os";
 import path from "node:path";
+import { createRotatingLogger } from "./logging.mjs";
 
 import {
+  recordPoolExhaustion,
+  observePoolRecovery,
+  poolRecoveryBatch,
   addPassiveError,
   allowsEmergencyCoolingReuse,
   beginSelectionValidation,
@@ -58,6 +62,9 @@ const args = new Set(process.argv.slice(2));
 const shadowMode = args.has("--shadow") || args.has("--dry-run") || args.has("--once");
 const onceMode = args.has("--once");
 const mainRoute = process.env.ROUTE_PROFILE === "main";
+const fileLogger = !shadowMode && process.env.LOG_PATH
+  ? createRotatingLogger({ filePath: process.env.LOG_PATH })
+  : null;
 
 function envEnabled(name) {
   return /^(1|true|yes|on)$/i.test(process.env[name] || "");
@@ -219,12 +226,14 @@ const localCommandChildren = new Set();
 let lastProviderConfirmationAt = 0;
 
 function log(level, event, fields = {}) {
-  process.stdout.write(`${JSON.stringify({
+  const line = `${JSON.stringify({
     time: new Date().toISOString(),
     level,
     event,
     ...fields,
-  })}\n`);
+  })}\n`;
+  if (fileLogger) fileLogger.write(line);
+  else process.stdout.write(line);
 }
 
 function sleep(ms) {
@@ -891,18 +900,28 @@ async function performCurrentCheck() {
     slowFailureThreshold: config.slowFailureThreshold,
     slowFailureWindowMs: config.slowFailureWindowMs,
   });
+  const pendingPassiveFault = state.passiveErrors.filter(
+    (event) => now - event.at <= config.passiveWindowMs,
+  ).length >= config.passiveThreshold;
+  if (!mainRoute) {
+    const wasOutage = Boolean(state.poolOutage);
+    state = observePoolRecovery(state, result, now, {
+      blocked: Boolean(instabilityReason || pendingPassiveFault || state.selectionValidation)
+        || !isRealPathProbeResult(result),
+    });
+    if (wasOutage && !state.poolOutage) log("info", "pool_recovery_stable", { node });
+  }
   if (result.ok) {
     state.passiveErrors = state.passiveErrors.filter(
       (event) => now - event.at <= config.passiveWindowMs,
     );
-    const pendingPassiveFault = state.passiveErrors.length >= config.passiveThreshold;
-    if (!instabilityReason && !pendingPassiveFault) {
+    if (!instabilityReason && !pendingPassiveFault && !state.poolOutage) {
       state.nextRecoveryAt = 0;
       state.recoveryExhaustions = 0;
     } else if (state.nextRecoveryAt > 0 || state.recoveryExhaustions > 0) {
       log("warning", "recovery_backoff_preserved", {
         node,
-        reason: instabilityReason || "passive_transport_errors",
+        reason: instabilityReason || (pendingPassiveFault ? "passive_transport_errors" : "pool_stability_pending"),
         nextRecoveryAt: state.nextRecoveryAt,
         recoveryExhaustions: state.recoveryExhaustions,
       });
@@ -1290,6 +1309,7 @@ function scheduleRecoveryRetry(reason) {
       providerUnavailableScheduleMs: config.providerUnavailableBackoffMs,
       activeTraffic: recoveryStartedWithActiveTraffic
         || hasRecentTraffic(state, Date.now(), config.activeTrafficGraceMs),
+      poolOutageRounds: mainRoute ? 0 : state.poolOutage?.rounds || 0,
     },
   );
   state.recoveryExhaustions += 1;
@@ -1470,23 +1490,28 @@ async function recover(reason) {
   });
   // Shared native health can be stale or changed by a user's speed test.
   // Keep it as refresh telemetry, never as admission to independent validation.
-  const recoveryCandidates = [...new Set(candidates)];
+  const recoveryCandidates = poolRecoveryBatch([...new Set(candidates)], mainRoute ? null : state.poolOutage);
+  if (!mainRoute && state.poolOutage) {
+    state.poolOutage.cursor += recoveryCandidates.length;
+    log("warning", "pool_recovery_batch", { candidates: recoveryCandidates, total: candidates.length });
+  }
   const tested = [];
+  const standbyOptions = {
+    limit: config.hotStandbyCount,
+    requiredPasses: config.hotStandbyRequiredPasses,
+    probeTtlMs: config.hotStandbyProbeTtlMs,
+    historyWindowMs: config.hotStandbyHistoryWindowMs,
+    minSpanMs: config.hotStandbyMinSpanMs,
+    rollingWindowMs: config.rollingWindowMs,
+    pathHistoryWindowMs: config.pathHistoryWindowMs,
+  };
   const radarReadyStandbys = rankHotStandbys(
-    recoveryCandidates,
+    candidates,
     state,
     Date.now(),
-    {
-      limit: config.hotStandbyCount,
-      requiredPasses: config.hotStandbyRequiredPasses,
-      probeTtlMs: config.hotStandbyProbeTtlMs,
-      historyWindowMs: config.hotStandbyHistoryWindowMs,
-      minSpanMs: config.hotStandbyMinSpanMs,
-      rollingWindowMs: config.rollingWindowMs,
-      pathHistoryWindowMs: config.pathHistoryWindowMs,
-    },
+    { ...standbyOptions, limit: candidates.length },
   );
-  const hotStandbys = radarReadyStandbys.filter((name) => (
+  const fastQualified = radarReadyStandbys.filter((name) => (
     hasRecentStablePathEvidence(state, name, Date.now(), {
       requiredPasses: config.hotStandbyFastPathRequiredPasses,
       historyWindowMs: config.hotStandbyFastPathHistoryWindowMs,
@@ -1494,8 +1519,11 @@ async function recover(reason) {
       minSpanMs: config.hotStandbyFastPathMinSpanMs,
     })
   ));
+  // Apply the stronger fast-path qualification before taking the two slots.
+  // Otherwise high-ranked ordinary-ready nodes can hide a qualified backup.
+  const hotStandbys = rankHotStandbys(fastQualified, state, Date.now(), standbyOptions);
   const downgradedStandbys = radarReadyStandbys.filter(
-    (name) => !hotStandbys.includes(name),
+    (name) => !fastQualified.includes(name),
   );
   log("info", "hot_standby_recovery_candidates", {
     reason,
@@ -1701,6 +1729,14 @@ async function recover(reason) {
     }
   }
 
+  if (!mainRoute) {
+    state = recordPoolExhaustion(
+      state,
+      new Set(tested.filter(name => name !== before)).size,
+      new Set(candidates.filter(name => name !== before)).size,
+      Date.now(),
+    );
+  }
   const retryInMs = scheduleRecoveryRetry(reason);
   log("error", "recovery_exhausted", {
     reason,
@@ -2088,6 +2124,7 @@ async function shutdown(signal) {
     log("warning", "state_save_failed", { error: error.message });
   }
   log("info", "controller_stopped", { signal });
+  await fileLogger?.flush();
 }
 
 function stopAndExit(signal) {

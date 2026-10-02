@@ -46,6 +46,7 @@ export function newWatchdogState() {
     lastOpenAITrafficAt: 0,
     selectionValidation: null,
     hotStandbyExploration: null,
+    poolOutage: null,
     passiveErrors: [],
     nodes: {},
   };
@@ -73,6 +74,7 @@ export function normalizeState(saved) {
     ...newWatchdogState(),
     ...saved,
     recoveryExhaustions: Math.max(0, Number(saved.recoveryExhaustions) || 0),
+    poolOutage: normalizePoolOutage(saved.poolOutage),
     selectionValidation: saved.selectionValidation?.to
       ? {
           from: saved.selectionValidation.from || null,
@@ -727,12 +729,40 @@ function compareNodeHealth(
 
 function candidateBucket(name) {
   const region = nodeRegion(name);
-  const family = /HY2/i.test(name) ? "HY2" : /TCP/i.test(name) ? "TCP" : "STANDARD";
+  const family = /HY2|hysteria2/i.test(name) ? "HY2"
+    : /trojan/i.test(name) ? "TROJAN"
+      : /tuic/i.test(name) ? "TUIC"
+        : /TCP/i.test(name) ? "TCP" : "STANDARD";
   return `${region}:${family}`;
 }
 
 export function nodeRegion(name = "") {
-  return name.match(/^(JP|KR|SG|TW|US)/i)?.[1]?.toUpperCase() || "OTHER";
+  // Text takes precedence: some Taiwan nodes carry a China flag.
+  const labels = [
+    ["JP", /日本|Japan/i], ["KR", /韩国|韓國|Korea/i],
+    ["SG", /新加坡|Singapore/i], ["TW", /台湾|台灣|Taiwan/i],
+    ["US", /美国|美國|United States/i],
+  ];
+  for (const [region, pattern] of labels) if (pattern.test(name)) return region;
+  const code = name.match(/(?:^|[^A-Za-z])(JP|KR|SG|TW|US)(?=[^A-Za-z]|$)/i)?.[1];
+  if (code) return code.toUpperCase();
+  for (const [flag, region] of [["🇯🇵", "JP"], ["🇰🇷", "KR"], ["🇸🇬", "SG"], ["🇹🇼", "TW"], ["🇺🇸", "US"]]) {
+    if (name.includes(flag)) return region;
+  }
+  return "OTHER";
+}
+
+export function diverseStandbys(ranked, limit) {
+  const selected = [];
+  const buckets = new Set();
+  for (const name of ranked) {
+    const bucket = candidateBucket(name);
+    if (buckets.has(bucket)) continue;
+    selected.push(name);
+    buckets.add(bucket);
+    if (selected.length >= limit) return selected.slice(0, limit);
+  }
+  return [...selected, ...ranked.filter(name => !selected.includes(name))].slice(0, limit);
 }
 
 export function pickRecoveryBatch(candidates, state, now = Date.now(), options = {}) {
@@ -983,7 +1013,7 @@ export function rankHotStandbys(
     limit = 2,
     pathHistoryWindowMs = DEFAULT_PATH_HISTORY_WINDOW_MS,
   } = options;
-  return [...new Set(candidates)]
+  const ranked = [...new Set(candidates)]
     .filter((name) => name && name !== state.current)
     .map((name) => {
       const node = { ...newNodeState(), ...(state.nodes[name] || {}) };
@@ -994,8 +1024,8 @@ export function rankHotStandbys(
       && recentPathSuccessfulSeries(node, now, options)
     ))
     .sort(compareHotStandbyHealth)
-    .slice(0, limit)
     .map(({ name }) => name);
+  return diverseStandbys(ranked, limit);
 }
 
 export function pickHotStandbyProbeBatch(
@@ -1140,13 +1170,17 @@ export function recoveryBackoffDelayForReason(
     defaultScheduleMs = [10_000, 30_000, 60_000, 5 * 60_000],
     providerUnavailableScheduleMs = [10_000, 30_000, 30_000],
     activeTraffic = false,
+    poolOutageRounds = 0,
   } = options;
-  const delay = recoveryBackoffDelay(
+  const baseDelay = recoveryBackoffDelay(
     priorExhaustions,
     reason === "provider_health_unavailable"
       ? providerUnavailableScheduleMs
       : defaultScheduleMs,
   );
+  const delay = Math.max(baseDelay, Math.min(180_000, 30_000 * nonnegativeInteger(poolOutageRounds)));
+  // Pool backoff must not override the established critical/active retry cap.
+  if (reason === "provider_health_unavailable") return Math.min(delay, baseDelay, 60_000);
   return isCriticalRecoveryReason(reason) || activeTraffic
     ? Math.min(delay, 60_000)
     : delay;
@@ -1212,4 +1246,59 @@ export function observeNetworkPath(observation, path, now, stableMs = 10_000) {
     return { current: path, initialized: true, pending: null, since: 0, lastObservedAt: now, changed: true };
   }
   return { ...previous, pending: path, since: continuous ? previous.since : now, lastObservedAt: now, changed: false };
+}
+function nonnegativeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function resetPoolObservation(pool) {
+  return { ...pool, stableSince: 0, passes: 0, node: null, selectedAt: 0, lastPassAt: 0 };
+}
+
+function normalizePoolOutage(pool) {
+  if (!pool || typeof pool !== "object" || Array.isArray(pool)) return null;
+  // Keep retry history, but require a new observation after a process restart.
+  return resetPoolObservation({
+    startedAt: nonnegativeInteger(pool.startedAt),
+    rounds: Math.max(1, nonnegativeInteger(pool.rounds)),
+    cursor: nonnegativeInteger(pool.cursor),
+  });
+}
+
+// Pool-wide failure is independent of a selected node's failure counter.
+// Counts are distinct alternatives, excluding the current failed route.
+export function recordPoolExhaustion(state, tested, total, now = Date.now()) {
+  const previous = state.poolOutage;
+  if (!previous && (total <= 0 || tested < Math.min(total, Math.max(3, Math.ceil(total / 2))))) return state;
+  return { ...state, poolOutage: resetPoolObservation({
+    ...previous, startedAt: previous?.startedAt || now,
+    rounds: (previous?.rounds || 0) + 1,
+    cursor: nonnegativeInteger(previous?.cursor),
+  }) };
+}
+
+export function observePoolRecovery(state, result, now, options = {}) {
+  const pool = state.poolOutage;
+  if (!pool) return state;
+  if (result.ok !== true || options.blocked || !state.current) {
+    return { ...state, poolOutage: resetPoolObservation(pool) };
+  }
+  const selectedAt = state.currentSelectedAt || 0;
+  const sameTenure = pool.node === state.current && pool.selectedAt === selectedAt && pool.passes > 0;
+  if (sameTenure && now === pool.lastPassAt) return state;
+  const continuous = sameTenure && now > pool.lastPassAt && now - pool.lastPassAt <= 60_000;
+  const stableSince = continuous ? pool.stableSince : now;
+  const passes = continuous ? pool.passes + 1 : 1;
+  if (passes >= 4 && now - stableSince >= 90_000) {
+    return { ...state, poolOutage: null };
+  }
+  return { ...state, poolOutage: { ...pool, node: state.current, selectedAt, stableSince, passes, lastPassAt: now } };
+}
+
+export function poolRecoveryBatch(candidates, pool, limit = 6) {
+  if (!pool) return candidates;
+  const size = Math.min(candidates.length, nonnegativeInteger(limit));
+  if (size === 0) return [];
+  const offset = nonnegativeInteger(pool.cursor) % candidates.length;
+  return Array.from({ length: size }, (_, i) => candidates[(offset + i) % candidates.length]);
 }

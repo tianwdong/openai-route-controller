@@ -1,7 +1,7 @@
 .DS_Store
 node_modules/
 *.log
-*.log.1
+*.log.*
 state.json
 state.json.*
 backups/
@@ -14,3 +14,13 @@ node.path
 *.disabled.*
 .vscode/
 .idea/
+
+# AWR local runtime state
+.awr/state.db
+.awr/state.db-*
+.awr/artifacts/
+.awr/mutations/
+.awr/cache/
+.awr/clients/
+.awr/executions/
+.awr/content-reviews/

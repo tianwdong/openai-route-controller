@@ -14,9 +14,10 @@ try {
   $env:MIHOMO_PROXY = $settings.proxyUrl
   $env:OPENAI_GROUP = $settings.groupName
   $env:STATE_PATH = Join-Path $installRoot "state.json"
+  $env:LOG_PATH = Join-Path $installRoot "controller.log"
   $env:CURL_PATH = (Get-Command curl.exe -ErrorAction Stop).Source
 
-  $stdoutLog = Join-Path $installRoot "controller.log"
+  $stdoutLog = Join-Path $installRoot "controller.bootstrap.log"
   $stderrLog = Join-Path $installRoot "controller.error.log"
   foreach ($logPath in @($stdoutLog, $stderrLog)) {
     if ((Test-Path $logPath) -and (Get-Item $logPath).Length -gt 20MB) {

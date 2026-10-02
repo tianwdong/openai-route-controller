@@ -11,6 +11,54 @@ const controllerDefinitions = source.slice(source.indexOf('const args ='), sourc
 const O = 'JP-ORIGIN', C = 'TW-CANDIDATE', M = 'US-MANUAL';
 const Z1 = 'ZZ-PLACEHOLDER-1', Z2 = 'ZZ-PLACEHOLDER-2';
 
+test('current success cannot clear pool outage while passive failures remain pending', async () => {
+  const { context, evaluate } = createFixture('pool_passive_fault');
+  evaluate(`
+    state.currentFailures = 0;
+    state.currentFailureStartedAt = 0;
+    state.poolOutage = {
+      rounds: 3, cursor: 6, node: state.current, selectedAt: state.currentSelectedAt,
+      passes: 3, stableSince: Date.now() - 120000, lastPassAt: Date.now() - 25000,
+    };
+    state.passiveErrors = [{ at: Date.now() - 2000 }, { at: Date.now() - 1000 }];
+    state.nextRecoveryAt = Date.now() + 60000;
+  `);
+  await context.audit.checkCurrent();
+  assert.ok(context.audit.getState().poolOutage);
+  assert.equal(context.audit.getState().poolOutage.passes, 0);
+  assert.ok(context.audit.getState().nextRecoveryAt > Date.now());
+});
+
+test('controller retry scheduling cannot reapply pool delay after the critical ceiling', () => {
+  const { evaluate } = createFixture('pool_retry_ceiling');
+  evaluate('state.poolOutage = { rounds: 6 }; state.recoveryExhaustions = 6;');
+  assert.equal(evaluate('scheduleRecoveryRetry("passive_transport_errors")'), 60000);
+  assert.equal(evaluate('scheduleRecoveryRetry("provider_health_unavailable")'), 30000);
+});
+
+test('ordinary-ready nodes cannot hide a later fast-qualified standby', async () => {
+  const { context, evaluate, trace } = createFixture('fast_standby_admission');
+  evaluate(`
+    const sampleTime = Date.now();
+    for (const name of ${JSON.stringify([C, Z1, M])}) {
+      if (name !== ${JSON.stringify(M)}) {
+        for (let index = 0; index < 100; index += 1) {
+          state = recordNodePathProbe(state, name, { ok: true }, sampleTime - 100000 - index * 10000);
+        }
+        state = recordNodePathProbe(state, name, { ok: false }, sampleTime - 65000);
+      }
+      const ages = name === ${JSON.stringify(M)} ? [60000, 40000, 20000, 0] : [40000, 20000, 0];
+      for (const age of ages) {
+        state = recordNodePathProbe(state, name, { ok: true }, sampleTime - age);
+      }
+    }
+    state.nodes[${JSON.stringify(M)}].ejectionCount = 1;
+  `);
+  await context.audit.maybeRecover();
+  const event = trace.find(e => e.event === 'hot_standby_recovery_candidates');
+  assert.ok(event.candidates.includes(M), 'fast eligibility must be applied before limiting to two slots');
+});
+
 function createFixture(scenario) {
   const trace = [];
   const fixture = { scenario, selector: O, candidates: [O, C, M, Z1, Z2], phase: 'qualification', switched: false };

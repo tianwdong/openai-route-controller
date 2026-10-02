@@ -23,3 +23,11 @@ application rules or provider-specific subscriptions.
 - Add or update focused tests for every circuit-breaker state transition.
 - Run `npm run verify` before delivery.
 - Keep documentation consistent with the constants in `controller.mjs`.
+
+## Work continuity
+
+For continuing project work, use the AWR mapping in `.awr/project.toml` and the
+single source ledger `docs/work-ledger.yaml`. Inspect current work and context
+before execution, and record verification evidence and a handoff checkpoint.
+Runtime databases and local review receipts must not be published. This metadata
+does not authorize service deployment or changes outside the current user request.

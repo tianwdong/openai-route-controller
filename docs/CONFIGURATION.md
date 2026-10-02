@@ -13,6 +13,7 @@
 | `OPENAI_GROUP` | `OpenAI 自动选择` | 相同 | 必须对应一个非空 Selector |
 | `STATE_PATH` | `~/Library/Application Support/OpenAI Route Controller/state.json` | `%LOCALAPPDATA%\OpenAI Route Controller\state.json` | 本地滚动健康状态 |
 | `CURL_PATH` | 自动查找 `curl` | `curl.exe` | curl 可执行文件 |
+| `LOG_PATH` | 手动运行时为空 | 相同 | 本地日志绝对路径；两平台安装器设置为安装目录下的 `controller.log` |
 | `MACOS_SYSTEM_PROXY_SYNC` | `0` | 不适用 | 设为 `1` 后，自动维护指定 macOS 网络服务的 HTTP／HTTPS／SOCKS 系统代理 |
 | `MACOS_PROXY_SERVICES` | `Wi-Fi` | 不适用 | 逗号分隔的网络服务名；仅在系统代理同步开启时生效 |
 | `NETWORK_TRANSITION_GRACE_MS` | `20000` | 不适用 | 默认网卡或网关变化后的保护期；最小 5000 毫秒 |
@@ -162,3 +163,57 @@ the guards as an exclusive cross-process lock or proof of streaming health.
 `active_failure_confirmation_discarded` distinguish invalidated work from a real
 probe failure. `controller_unconfirmed` identifies validation after a write with
 an uncertain response; it is not a manual selection or completed recovery.
+
+## Pool-wide degradation protection
+
+Region diversity recognizes Chinese (including traditional labels), English,
+country flags and legacy JP/TW/US/KR/SG codes. Qualified hot standbys retain the
+best health-ranked candidate, then prefer a different region/protocol bucket
+before filling remaining slots. This is label diversity, not proof of independent
+server infrastructure; different subscription labels may share an ingress host.
+
+OpenAI recovery enters pool-outage mode when an exhausted search has tested at
+least half the distinct alternatives (minimum three, or every alternative for a
+smaller pool). The current failed node is excluded from both counts. Subsequent searches rotate
+through six candidates, retaining access to independently qualified hot standbys
+and the existing provider-cache refresh batch. No subscription nodes are removed.
+Retry spacing grows by 30 seconds per exhausted round, capped at 180 seconds;
+normal larger backoff still applies to idle, non-critical failures. This never
+overrides the 60-second critical/active cap or the existing provider-failure
+schedule (10/30/30 seconds). Standby evidence can wake recovery early.
+
+A single successful probe or node switch does not clear pool-outage mode. Clearing
+requires four consecutive real current-path successes in the same selection tenure spanning
+at least 90 seconds, with no inter-probe gap greater than 60 seconds. Failures,
+pending passive faults, current-path instability, incomplete selection validation,
+node changes, restarts and long observation gaps restart this observation. Returning
+to the same node name cannot combine different tenures; repeated timestamps do
+not add passes. Retry rounds and the candidate cursor survive restart. This is a
+transport-stability observation, not proof of authenticated streaming health.
+Pool-outage mode is OpenAI-only. Both profiles retain candidate qualification,
+post-switch checks, cooldown and rollback.
+
+Fast-standby qualification is applied to the entire ordinary-ready set before
+choosing the two recovery slots. A high-ranked candidate with only ordinary
+readiness cannot hide a later candidate with valid fast-path evidence.
+
+## Managed logs
+
+`LOG_PATH` enables asynchronous JSON Lines logging on local storage. Defaults are
+10 MiB per file, five files total (`controller.log` and `.1` through `.4`, with `.1`
+the newest archive). Every write opens and closes the file, so external removal or
+rename is repaired by the next record, without restarting the route controller.
+Only one process may own a log path; give multiple profiles separate files.
+
+The queue is capped at 1 MiB, and a record over 64 KiB is replaced with an omission
+marker. Disk errors or queue overflow do not stop routing: a rate-limited
+`log_write_failed` warning is sent to stderr without repeating raw event data or
+paths. Records can be lost during I/O failure, overload, abrupt termination or the
+unlink/write race; this is bounded operational logging, not a durable audit journal.
+Existing oversized files are rotated on the next write, not retroactively shrunk.
+
+Without `LOG_PATH`, stdout behavior is unchanged. Shadow modes always use stdout
+and ignore `LOG_PATH` (use a temporary `STATE_PATH` as before). Installers direct
+ordinary stdout to `controller.bootstrap.log` and stderr to `controller.error.log`;
+only the primary `controller.log` is managed by this rotation policy. Do not redirect
+stdout or another process to the same managed file. Logs remain private local data.

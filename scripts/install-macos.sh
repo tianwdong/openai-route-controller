@@ -63,13 +63,15 @@ if [ -e "$INSTALL_DIR/controller.mjs" ] || [ -e "$INSTALL_DIR/lib.mjs" ] || [ -e
   mkdir -p "$BACKUP_DIR"
   [ ! -e "$INSTALL_DIR/controller.mjs" ] || cp "$INSTALL_DIR/controller.mjs" "$BACKUP_DIR/controller.mjs"
   [ ! -e "$INSTALL_DIR/lib.mjs" ] || cp "$INSTALL_DIR/lib.mjs" "$BACKUP_DIR/lib.mjs"
+  [ ! -e "$INSTALL_DIR/logging.mjs" ] || cp "$INSTALL_DIR/logging.mjs" "$BACKUP_DIR/logging.mjs"
   [ ! -e "$PLIST_PATH" ] || cp "$PLIST_PATH" "$BACKUP_DIR/$(basename "$PLIST_PATH")"
   echo "Existing files backed up to: $BACKUP_DIR"
 fi
 
 cp "$REPO_DIR/controller.mjs" "$INSTALL_DIR/controller.mjs"
 cp "$REPO_DIR/lib.mjs" "$INSTALL_DIR/lib.mjs"
-chmod 600 "$INSTALL_DIR/controller.mjs" "$INSTALL_DIR/lib.mjs"
+cp "$REPO_DIR/logging.mjs" "$INSTALL_DIR/logging.mjs"
+chmod 600 "$INSTALL_DIR/controller.mjs" "$INSTALL_DIR/lib.mjs" "$INSTALL_DIR/logging.mjs"
 
 escape_sed() {
   printf '%s' "$1" | sed 's/[\\&|]/\\&/g'

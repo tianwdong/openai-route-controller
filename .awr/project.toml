@@ -1,0 +1,41 @@
+[project]
+name = "openai-route-controller"
+external_key = "openai-route-controller"
+authority_mode = "source_first"
+authorized_roots = []
+context_profile = "minimal"
+
+[[sources]]
+domain = "ledger"
+role = "primary"
+path = "docs/work-ledger.yaml"
+adapter = "yaml-ledger-v1"
+
+[sources.options]
+
+[[sources]]
+domain = "plan"
+role = "supporting"
+path = "README.md"
+adapter = "markdown-heading-v1"
+
+[sources.options]
+
+[[sources]]
+domain = "plan"
+role = "supporting"
+path = "ROADMAP.md"
+adapter = "markdown-heading-v1"
+
+[sources.options]
+
+[[sources]]
+domain = "rules"
+role = "primary"
+path = "AGENTS.md"
+adapter = "markdown-rules-v1"
+
+[sources.options]
+scope = "project"
+severity = "hard"
+value = "openai-route-controller"

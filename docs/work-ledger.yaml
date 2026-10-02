@@ -1,0 +1,18 @@
+goals:
+  - id: route-reliability
+    title: Reliable route recovery
+    status: active
+    summary: Improve route recovery using reproducible evidence and publish verified source changes. Local deployment is separate.
+    provenance: Maintainer-requested strategy review and GitHub synchronization.
+work_items:
+  - id: ROUTE-RELIABILITY-001
+    title: Harden pool recovery and retain diagnostic logs
+    status: in_progress
+    goal: route-reliability
+    acceptance:
+      - Pool recovery cannot clear on stale, interrupted or still-failing evidence.
+      - Critical retries and qualified standby selection remain bounded and tested.
+      - Installed logging survives file removal and rotates with bounded retention.
+      - Repository verification passes and reviewed changes are synchronized to GitHub.
+    next_action: Repair failing pool-recovery regressions and add rotating log coverage
+    summary: Source changes only; no local service restart or deployment is included.

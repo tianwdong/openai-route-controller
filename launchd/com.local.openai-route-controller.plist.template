@@ -30,6 +30,8 @@
     <string>__NETWORK_TRANSITION_GRACE_MS__</string>
     <key>STATE_PATH</key>
     <string>__INSTALL_DIR__/state.json</string>
+    <key>LOG_PATH</key>
+    <string>__INSTALL_DIR__/controller.log</string>
     <key>CURL_PATH</key>
     <string>__CURL_PATH__</string>
   </dict>
@@ -44,7 +46,7 @@
   <integer>10</integer>
 
   <key>StandardOutPath</key>
-  <string>__INSTALL_DIR__/controller.log</string>
+  <string>__INSTALL_DIR__/controller.bootstrap.log</string>
   <key>StandardErrorPath</key>
   <string>__INSTALL_DIR__/controller.error.log</string>
 </dict>

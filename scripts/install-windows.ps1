@@ -82,7 +82,7 @@ $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 if (Test-Path $installRoot) {
   $backupRoot = Join-Path $installRoot "backups\$timestamp"
   New-Item -ItemType Directory -Force $backupRoot | Out-Null
-  foreach ($fileName in @("controller.mjs", "lib.mjs", "settings.json", "node.path", "mihomo.secret.dpapi")) {
+  foreach ($fileName in @("controller.mjs", "lib.mjs", "logging.mjs", "start-controller.ps1", "settings.json", "node.path", "mihomo.secret.dpapi")) {
     $existing = Join-Path $installRoot $fileName
     if (Test-Path $existing) {
       Copy-Item $existing (Join-Path $backupRoot $fileName)
@@ -99,6 +99,7 @@ if ($existingTask) {
 
 Copy-Item (Join-Path $repoRoot "controller.mjs") (Join-Path $installRoot "controller.mjs") -Force
 Copy-Item (Join-Path $repoRoot "lib.mjs") (Join-Path $installRoot "lib.mjs") -Force
+Copy-Item (Join-Path $repoRoot "logging.mjs") (Join-Path $installRoot "logging.mjs") -Force
 Copy-Item (Join-Path $PSScriptRoot "start-controller.ps1") (Join-Path $installRoot "start-controller.ps1") -Force
 Set-Content -NoNewline -Encoding UTF8 (Join-Path $installRoot "node.path") $nodePath
 Set-Content -NoNewline -Encoding UTF8 (Join-Path $installRoot "mihomo.secret.dpapi") $encryptedSecret

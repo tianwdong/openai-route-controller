@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Kept pool-degradation retry bounds independent of one-off probe successes;
+  pending faults, selection changes and restarts reset stable-recovery observation.
+- Preserved critical/active and provider retry ceilings during pool-wide outages,
+  including small candidate pools and safe persisted cursor defaults.
+- Recognized multilingual subscription region labels and diversified qualified
+  standbys; applied fast-path qualification before limiting recovery slots.
+- Added asynchronous, bounded and rotating local logs to both platform installers;
+  removed log files are recreated on the next event without restarting routing.
+- Added regression coverage for pool transitions, admission ordering and log loss.
+
 - Separated standby ranking and readiness from short-probe success counters,
   preserving complete-path failures when native delay tests turn green.
 - Reserved one bounded exploration slot when no fast standby is ready, with

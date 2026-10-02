@@ -16,7 +16,7 @@ function runController(env, stopEvent = null, stopCount = 1) {
     const child = spawn(
       process.execPath,
       stopEvent ? [controllerPath] : [controllerPath, "--once", "--shadow"],
-      { env, stdio: ["ignore", "pipe", "pipe"] },
+      { env: { ...env, LOG_PATH: env.LOG_PATH || "" }, stdio: ["ignore", "pipe", "pipe"] },
     );
     let stdout = "";
     let stderr = "";
@@ -60,6 +60,8 @@ test(
     const nodeName = "JP-TEST";
     const secret = "integration-test-secret";
     const statePath = path.join(temporary, "state.json");
+    const existingLogPath = path.join(temporary, "live.log");
+    await writeFile(existingLogPath, "existing-live-log\n");
     await writeFile(statePath, JSON.stringify({
       version: 7,
       current: nodeName,
@@ -137,6 +139,7 @@ test(
       MIHOMO_PROXY: "http://127.0.0.1:1",
       OPENAI_GROUP: groupName,
       STATE_PATH: statePath,
+      LOG_PATH: existingLogPath,
       CURL_PATH: fakeCurl,
     });
 
@@ -149,9 +152,31 @@ test(
       1,
     );
     assert.equal(deleteRequests, 0);
+    assert.equal(await readFile(existingLogPath, "utf8"), "existing-live-log\n", "shadow must not write to the configured live log");
     assert.ok(authenticatedRequests >= 3);
   },
 );
+
+test("live startup failures are flushed to the managed log without duplicate stdout", async context => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "route-log-integration-"));
+  context.after(() => rm(temporary, { recursive: true, force: true }));
+  const server = http.createServer((request, response) => {
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ type: "Fallback", now: "TEST", all: ["TEST"] }));
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  context.after(() => new Promise(resolve => server.close(resolve)));
+  const logPath = path.join(temporary, "controller.log");
+  const result = await runController({
+    ...process.env, ROUTE_PROFILE: "", OPENAI_GROUP: "Log Test", MIHOMO_SECRET: "",
+    MIHOMO_API: `http://127.0.0.1:${server.address().port}`, MIHOMO_SOCKET: "",
+    STATE_PATH: path.join(temporary, "state.json"), LOG_PATH: logPath,
+  }, "controller_failed");
+  assert.equal(result.code, 1);
+  assert.equal(result.stdout, "");
+  const events = (await readFile(logPath, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.equal(events.at(-1).event, "controller_failed");
+});
 
 test("HTTP API transport refuses a non-loopback controller", async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "openai-route-controller-test-"));

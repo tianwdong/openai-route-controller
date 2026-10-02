@@ -22,6 +22,22 @@ const fastOptions = {
 };
 const options = { readyOptions, fastOptions };
 
+test("fast standby filtering preserves diversity after weaker ready nodes drop out", () => {
+  let state = newWatchdogState();
+  state.current = "CURRENT";
+  const candidates = ["JP-A", "JP-B", "TW-READY", "SG-FAST"];
+  for (const name of candidates) {
+    const ages = name === "TW-READY" ? [40_000, 20_000, 0] : [60_000, 40_000, 20_000, 0];
+    for (const age of ages) state = fullProbe(state, name, true, now - age);
+  }
+  // Region diversity of the ordinary-ready set places TW-READY ahead of JP-B.
+  // Once TW-READY is removed, choose among the still-qualified fast candidates.
+  state.nodes["SG-FAST"].ejectionCount = 1;
+  const plan = planHotStandbyProbes(candidates, state, now, options);
+  assert.deepEqual(plan.batch, ["JP-A", "SG-FAST"]);
+  assert.equal(plan.exploration, null);
+});
+
 function fullProbe(state, name, ok, at) {
   const result = { ok, status: ok ? "405/403" : "000", delay: 20 };
   state = recordNodeProbe(state, name, result, at);
