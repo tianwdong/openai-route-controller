@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "work_item": "ROUTE-RELIABILITY-001",
+  "source_sha": "21566fe7adfb43f4a4d63f42f6b031492271ef02",
+  "command": "npm run verify; git push origin HEAD:main; git ls-remote origin refs/heads/main",
+  "scope": [
+    "pool recovery",
+    "fast standby admission",
+    "managed logs",
+    "installer wiring",
+    "GitHub source publication"
+  ],
+  "verified_at": 1790932965604,
+  "checks": [
+    {
+      "name": "pool_recovery_regressions",
+      "passed": true,
+      "details": "169-test suite passed. Regressions cover pending passive errors, selection tenure, duplicate observations, restart, small pools, persisted cursors and bounded retry ceilings.",
+      "criteria": [
+        "Pool recovery cannot clear on stale, interrupted or still-failing evidence.",
+        "Critical retries and qualified standby selection remain bounded and tested."
+      ]
+    },
+    {
+      "name": "fast_standby_admission",
+      "passed": true,
+      "details": "Regression confirms stronger qualification precedes two-slot limit and a qualified lower-ranked candidate remains available.",
+      "criteria": [
+        "Critical retries and qualified standby selection remain bounded and tested."
+      ]
+    },
+    {
+      "name": "log_lifecycle_and_installers",
+      "passed": true,
+      "details": "Unlink and rename recreation, ordered rotation, bounds, failure tolerance, shadow isolation and both installer wiring passed; Windows runtime was not executed.",
+      "criteria": [
+        "Installed logging survives file removal and rotates with bounded retention."
+      ]
+    },
+    {
+      "name": "repository_verification_and_publication",
+      "passed": true,
+      "details": "npm run verify: 169 passed, zero failed/skipped. Source commit push succeeded and git ls-remote returned exact 21566fe7adfb43f4a4d63f42f6b031492271ef02. No live service deployment.",
+      "criteria": [
+        "Repository verification passes and reviewed changes are synchronized to GitHub."
+      ]
+    }
+  ],
+  "supporting_reports": [
+    {
+      "path": "docs/verification/2026-10-02-reliability.md",
+      "sha256": "6d27822c8eb7d1d123d77c9d0eedaa34ed0c268b897b446f9b5986a2feb8793c"
+    },
+    {
+      "path": ".awr/artifacts/publish-21566fe.md",
+      "sha256": "4d2baf12b6fad0eac825cf2423cda68889bebb7a0a2731ccf0f8f6ef4b8f5ef5"
+    }
+  ],
+  "limitations": [
+    "Source verification and publication only; live service was not deployed or restarted.",
+    "Windows installer is statically tested only; no Windows runtime validation."
+  ]
+}

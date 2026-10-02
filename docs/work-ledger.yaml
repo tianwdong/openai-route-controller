@@ -7,12 +7,14 @@ goals:
 work_items:
   - id: ROUTE-RELIABILITY-001
     title: Harden pool recovery and retain diagnostic logs
-    status: in_progress
+    status: completed
     goal: route-reliability
     acceptance:
       - Pool recovery cannot clear on stale, interrupted or still-failing evidence.
       - Critical retries and qualified standby selection remain bounded and tested.
       - Installed logging survives file removal and rotates with bounded retention.
       - Repository verification passes and reviewed changes are synchronized to GitHub.
-    next_action: Repair failing pool-recovery regressions and add rotating log coverage
+    next_action: null
     summary: Source changes only; no local service restart or deployment is included.
+    "evidence": ["docs/verification/2026-10-02-reliability.md", "docs/verification/2026-10-02-completion.json"]
+    "verification": {"evidence_level":"locally_verified"}
